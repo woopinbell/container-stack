@@ -12,6 +12,8 @@ RUN rm -rf /var/lib/mysql/* \
     && mkdir -p /run/mysqld /var/lib/mysql \
     && chown -R mysql:mysql /run/mysqld /var/lib/mysql
 
+COPY conf/50-server.cnf /etc/mysql/mariadb.conf.d/50-server.cnf
+
 EXPOSE 3306
 
 CMD ["mariadbd", "--user=mysql", "--console"]
