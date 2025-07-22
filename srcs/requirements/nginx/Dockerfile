@@ -10,6 +10,7 @@ RUN apt-get update \
 
 RUN mkdir -p /etc/nginx/ssl /var/www/html /run/nginx
 
+COPY conf/nginx.conf /etc/nginx/sites-available/default
 COPY tools/docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 
 RUN chmod +x /usr/local/bin/docker-entrypoint.sh
