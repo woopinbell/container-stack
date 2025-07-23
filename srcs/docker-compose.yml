@@ -1,0 +1,37 @@
+services:
+  nginx:
+    build:
+      context: ./requirements/nginx
+    image: inception-nginx:local
+    container_name: inception-nginx
+    restart: unless-stopped
+    ports:
+      - "443:443"
+    networks:
+      - inception
+
+  mariadb:
+    build:
+      context: ./requirements/mariadb
+    image: inception-mariadb:local
+    container_name: inception-mariadb
+    restart: unless-stopped
+    networks:
+      - inception
+
+  wordpress:
+    build:
+      context: ./requirements/wordpress
+    image: inception-wordpress:local
+    container_name: inception-wordpress
+    restart: unless-stopped
+    networks:
+      - inception
+
+networks:
+  inception:
+    driver: bridge
+
+volumes:
+  mariadb_data:
+  wordpress_data:
