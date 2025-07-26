@@ -31,3 +31,9 @@ config:
 
 test:
 	python3 tests/validate_stack.py
+	@if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then \
+		$(COMPOSE) --env-file .env.example -f $(COMPOSE_FILE) config >/dev/null; \
+		echo "docker compose config passed"; \
+	else \
+		echo "docker compose not available; skipped compose config"; \
+	fi
