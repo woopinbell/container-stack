@@ -1,0 +1,30 @@
+COMPOSE := docker compose
+COMPOSE_FILE := srcs/docker-compose.yml
+ENV_FILE ?= .env
+
+COMPOSE_RUN := $(COMPOSE) --env-file $(ENV_FILE) -f $(COMPOSE_FILE)
+
+.PHONY: up down build logs ps clean fclean config
+
+up:
+	$(COMPOSE_RUN) up -d
+
+down:
+	$(COMPOSE_RUN) down --remove-orphans
+
+build:
+	$(COMPOSE_RUN) build
+
+logs:
+	$(COMPOSE_RUN) logs -f
+
+ps:
+	$(COMPOSE_RUN) ps
+
+clean: down
+
+fclean:
+	$(COMPOSE_RUN) down -v --rmi local --remove-orphans
+
+config:
+	$(COMPOSE_RUN) config
