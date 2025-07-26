@@ -4,7 +4,7 @@ ENV_FILE ?= .env
 
 COMPOSE_RUN := $(COMPOSE) --env-file $(ENV_FILE) -f $(COMPOSE_FILE)
 
-.PHONY: up down build logs ps clean fclean config
+.PHONY: up down build logs ps clean fclean test config
 
 up:
 	$(COMPOSE_RUN) up -d
@@ -28,3 +28,6 @@ fclean:
 
 config:
 	$(COMPOSE_RUN) config
+
+test:
+	python3 tests/validate_stack.py
