@@ -4,7 +4,7 @@ ENV_FILE ?= .env
 
 COMPOSE_RUN := $(COMPOSE) --env-file $(ENV_FILE) -f $(COMPOSE_FILE)
 
-.PHONY: up down build logs ps clean fclean test config
+.PHONY: up down build logs ps clean fclean test config smoke
 
 up:
 	$(COMPOSE_RUN) up -d
@@ -37,3 +37,6 @@ test:
 	else \
 		echo "docker compose not available; skipped compose config"; \
 	fi
+
+smoke:
+	tools/smoke_https.sh

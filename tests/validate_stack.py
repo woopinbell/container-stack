@@ -155,12 +155,18 @@ def validate_env_policy() -> None:
         fail(".env.example must point to secret files instead of embedding passwords")
 
 
+def validate_tools() -> None:
+    require_executable("tools/smoke_https.sh")
+    require_text("Makefile", [r"^smoke:", r"tools/smoke_https\.sh"])
+
+
 def main() -> None:
     validate_source_only()
     validate_compose()
     validate_dockerfiles()
     validate_configs()
     validate_env_policy()
+    validate_tools()
     print("static stack validation passed")
 
 
