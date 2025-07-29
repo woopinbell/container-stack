@@ -112,6 +112,7 @@ def validate_dockerfiles() -> None:
         ],
     }
     for service, patterns in services.items():
+        require_file(f"srcs/requirements/{service}/.dockerignore")
         require_text(f"srcs/requirements/{service}/Dockerfile", patterns)
         require_executable(f"srcs/requirements/{service}/tools/docker-entrypoint.sh")
 
