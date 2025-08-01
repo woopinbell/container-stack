@@ -3,13 +3,16 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
+import fcntl
+import hashlib
 import json
 import os
 from pathlib import Path
 import re
 import stat
 import subprocess
-from typing import BinaryIO
+from typing import BinaryIO, Iterator
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -24,6 +27,7 @@ SECRET_FILENAMES = {
 }
 NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
 NONBLOCK = getattr(os, "O_NONBLOCK", 0)
+DIRECTORY = getattr(os, "O_DIRECTORY", 0)
 
 
 class StackRuntimeError(RuntimeError):
@@ -221,3 +225,44 @@ def secret_payload(*values: str) -> bytes:
         if not PASSWORD_PATTERN.fullmatch(value):
             raise StackRuntimeError("표준 입력 비밀값의 형식이 올바르지 않습니다")
     return ("\n".join(values) + "\n").encode()
+
+
+@contextmanager
+def project_operation_lock(project_name: str) -> Iterator[None]:
+    lock_directory = Path("/tmp") / f"container-stack-operation-locks-{os.getuid()}"
+    try:
+        lock_directory.mkdir(mode=0o700)
+    except FileExistsError:
+        pass
+    _private_directory(lock_directory, "관리 작업 잠금 디렉터리")
+    directory_descriptor = os.open(
+        lock_directory,
+        os.O_RDONLY | DIRECTORY | NOFOLLOW,
+    )
+    lock_name = hashlib.sha256(project_name.encode()).hexdigest() + ".lock"
+    lock_descriptor: int | None = None
+    try:
+        lock_descriptor = os.open(
+            lock_name,
+            os.O_RDWR | os.O_CREAT | NOFOLLOW,
+            0o600,
+            dir_fd=directory_descriptor,
+        )
+        os.fchmod(lock_descriptor, 0o600)
+        info = os.fstat(lock_descriptor)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid():
+            raise StackRuntimeError("관리 작업 잠금 파일이 안전하지 않습니다")
+        try:
+            fcntl.flock(lock_descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as error:
+            raise StackRuntimeError(
+                "같은 프로젝트의 다른 관리 작업이 실행 중입니다"
+            ) from error
+        try:
+            yield
+        finally:
+            fcntl.flock(lock_descriptor, fcntl.LOCK_UN)
+    finally:
+        if lock_descriptor is not None:
+            os.close(lock_descriptor)
+        os.close(directory_descriptor)
