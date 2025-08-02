@@ -8,9 +8,9 @@ RUN apt-get update \
         mariadb-server \
     && rm -rf /var/lib/apt/lists/*
 
-RUN rm -rf /var/lib/mysql/* \
-    && mkdir -p /run/mysqld /var/lib/mysql \
-    && chown -R mysql:mysql /run/mysqld /var/lib/mysql
+RUN rm -rf /var/lib/mysql \
+    && mkdir -p /run/mysqld /var/lib/mysql-volume \
+    && chown -R mysql:mysql /run/mysqld /var/lib/mysql-volume
 
 COPY conf/50-server.cnf /etc/mysql/mariadb.conf.d/50-server.cnf
 COPY tools/docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh

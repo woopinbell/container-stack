@@ -65,9 +65,10 @@ def validate_compose() -> None:
             r"\"443:443\"",
             r"condition: service_healthy",
             r"healthcheck:",
-            r"secrets:",
+            r"x-secret-files:",
             r"mariadb_data:",
             r"wordpress_data:",
+            r"wordpress_config:",
         ],
     )
     if re.search(r"(^|\s)-\s*[\"']?80:", text):
@@ -75,15 +76,23 @@ def validate_compose() -> None:
     if "mysqladmin ping -h127.0.0.1 -uroot" in text:
         fail("mariadb healthcheck must not require TCP root login")
     if not re.search(
-        r"mysqladmin\s+--socket=/run/mysqld/mysqld\.sock\s+-uroot\s+-p.+\s+ping\s+--silent",
+        r"test -f /var/lib/mysql-volume/data/\.container-stack-initialized.+test -S /run/mysqld/mysqld\.sock.+kill -0 1",
         text,
     ):
-        fail("mariadb healthcheck must use the local socket as root")
+        fail("mariadb healthcheck must require the completed bootstrap marker")
+    if "/run/secrets" in text or re.search(r"^\s+secrets:", text, re.MULTILINE):
+        fail("runtime services must not mount secret files")
+    if re.search(r"^\s{6}[A-Z0-9_]*PASSWORD(?:_FILE)?:", text, re.MULTILINE):
+        fail("runtime service environments must not contain passwords")
+    if "/var/www/config" in re.search(
+        r"(?ms)^\s+nginx:.*?(?=^\s{2}[a-z])", text
+    ).group(0):
+        fail("nginx must not mount the WordPress configuration volume")
     if not re.search(
-        r"REQUEST_METHOD=GET\s+SCRIPT_NAME=/ping\s+SCRIPT_FILENAME=/ping\s+cgi-fcgi",
+        r"test -f /var/www/html/\.container-stack-initialized.+REQUEST_METHOD=GET\s+SCRIPT_NAME=/ping\s+SCRIPT_FILENAME=/ping\s+cgi-fcgi",
         text,
     ):
-        fail("wordpress healthcheck must call the FPM ping endpoint as a GET request")
+        fail("wordpress healthcheck must require bootstrap completion before FPM ping")
     for image in ("wordpress:", "mariadb:", "nginx:"):
         if re.search(rf"image:\s*{image}", text):
             fail(f"compose must not use the official {image.rstrip(':')} image directly")
@@ -100,7 +109,7 @@ def validate_dockerfiles() -> None:
         "mariadb": [
             r"FROM\s+debian:bookworm-slim|FROM\s+alpine:",
             r"mariadb-server",
-            r"rm -rf /var/lib/mysql/\*",
+            r"rm -rf /var/lib/mysql",
             r"COPY conf/50-server\.cnf",
             r"ENTRYPOINT",
         ],
@@ -135,7 +144,7 @@ def validate_configs() -> None:
     )
     require_text(
         "srcs/requirements/wordpress/conf/www.conf",
-        [r"listen = 0\.0\.0\.0:9000", r"ping\.path = /ping"],
+        [r"listen = 0\.0\.0\.0:9000", r"ping\.path = /ping", r"clear_env = yes"],
     )
 
 
@@ -158,7 +167,18 @@ def validate_env_policy() -> None:
 
 def validate_tools() -> None:
     require_executable("tools/smoke_https.sh")
-    require_text("Makefile", [r"^smoke:", r"tools/smoke_https\.sh"])
+    require_executable("tools/start_stack.py")
+    require_file("tools/stack_runtime.py")
+    require_text(
+        "Makefile",
+        [
+            r"^up:\n\s+python3 tools/start_stack\.py start",
+            r"^start-database:",
+            r"^start-application:",
+            r"^smoke:",
+            r"tools/smoke_https\.sh",
+        ],
+    )
 
 
 def main() -> None:

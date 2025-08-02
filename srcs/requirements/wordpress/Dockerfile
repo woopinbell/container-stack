@@ -21,8 +21,8 @@ RUN apt-get update \
 RUN curl -fsSL https://raw.githubusercontent.com/wp-cli/builds/gh-pages/phar/wp-cli.phar \
         -o /usr/local/bin/wp \
     && chmod +x /usr/local/bin/wp \
-    && mkdir -p /run/php /var/www/html \
-    && chown -R www-data:www-data /run/php /var/www/html
+    && mkdir -p /run/php /var/www/html /var/www/config \
+    && chown -R www-data:www-data /run/php /var/www/html /var/www/config
 
 WORKDIR /var/www/html
 

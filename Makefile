@@ -1,13 +1,21 @@
 COMPOSE := docker compose
 COMPOSE_FILE := srcs/docker-compose.yml
 ENV_FILE ?= .env
+PROJECT_NAME ?= container-stack
+WAIT_TIMEOUT ?= 300
 
-COMPOSE_RUN := $(COMPOSE) --env-file $(ENV_FILE) -f $(COMPOSE_FILE)
+COMPOSE_RUN := $(COMPOSE) --project-name $(PROJECT_NAME) --env-file $(ENV_FILE) -f $(COMPOSE_FILE)
 
-.PHONY: up down build logs ps clean fclean test config smoke
+.PHONY: up start-database start-application down build logs ps clean fclean test config smoke
 
 up:
-	$(COMPOSE_RUN) up -d
+	python3 tools/start_stack.py start --project "$(PROJECT_NAME)" --env-file "$(ENV_FILE)" --wait-timeout "$(WAIT_TIMEOUT)"
+
+start-database:
+	python3 tools/start_stack.py database --project "$(PROJECT_NAME)" --env-file "$(ENV_FILE)" --wait-timeout "$(WAIT_TIMEOUT)"
+
+start-application:
+	python3 tools/start_stack.py application --project "$(PROJECT_NAME)" --env-file "$(ENV_FILE)" --wait-timeout "$(WAIT_TIMEOUT)"
 
 down:
 	$(COMPOSE_RUN) down --remove-orphans
