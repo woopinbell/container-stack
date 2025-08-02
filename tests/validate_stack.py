@@ -181,6 +181,28 @@ def validate_tools() -> None:
     )
 
 
+def validate_bootstrap_recovery() -> None:
+    require_text(
+        "srcs/requirements/mariadb/tools/docker-entrypoint.sh",
+        [
+            r"\.container-stack-initialized",
+            r"timed out waiting for temporary MariaDB server",
+            r"staging_dir",
+            r"database-publish",
+            r"ALTER USER '\$\{MYSQL_USER\}'@'%'",
+        ],
+    )
+    require_text(
+        "srcs/requirements/wordpress/tools/docker-entrypoint.sh",
+        [
+            r"\.container-stack-initialized",
+            r"timed out waiting for authenticated MariaDB access",
+            r"wp core is-installed",
+            r"config_dir=.*?/var/www/config",
+        ],
+    )
+
+
 def main() -> None:
     validate_source_only()
     validate_compose()
@@ -188,6 +210,7 @@ def main() -> None:
     validate_configs()
     validate_env_policy()
     validate_tools()
+    validate_bootstrap_recovery()
     print("static stack validation passed")
 
 
