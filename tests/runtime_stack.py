@@ -328,6 +328,27 @@ class RuntimeStack:
             if self.credential_values[filename] in config:
                 raise StackError(f"wp-config.php에 불필요한 비밀값이 남았습니다: {filename}")
 
+    def fetch(self, path: str) -> str:
+        url = f"https://{self.domain}:{self.port}{path}"
+        result = subprocess.run(
+            [
+                "curl",
+                "--fail",
+                "--silent",
+                "--show-error",
+                "--insecure",
+                "--noproxy",
+                "*",
+                "--resolve",
+                f"{self.domain}:{self.port}:127.0.0.1",
+                url,
+            ],
+            check=True,
+            text=True,
+            capture_output=True,
+            timeout=PROCESS_TIMEOUT_SECONDS,
+        )
+        return result.stdout
 
     def verify_bootstrap(self) -> None:
         self.start()
@@ -350,6 +371,81 @@ class RuntimeStack:
                 raise StackError(f"{service} 초기화 완료 표식이 없습니다")
         print("bootstrap completion and secret boundary passed")
 
+    def verify_e2e(self) -> None:
+        blocked_port = self.port
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+            listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            listener.bind(("127.0.0.1", blocked_port))
+            listener.listen()
+            self.start()
+        if self.port == blocked_port:
+            raise StackError("HTTPS 포트 충돌 뒤 새 포트를 선택하지 않았습니다")
+        self._verify_legacy_config_migration()
+        self.assert_runtime_secret_boundary()
+        if self.fetch("/healthz").strip() != "ok":
+            raise StackError("nginx 상태 응답이 예상과 다릅니다")
+
+        nonce = secrets.token_hex(8)
+        title = f"종단 검증 {nonce}"
+        content = f"nginx-fpm-wordpress-mariadb-{nonce}"
+        post_id = self.wordpress(
+            "post",
+            "create",
+            f"--post_title={title}",
+            f"--post_content={content}",
+            "--post_status=publish",
+            "--porcelain",
+            capture=True,
+        )
+        if not post_id.isdigit():
+            raise StackError(f"WordPress가 유효한 글 번호를 반환하지 않았습니다: {post_id!r}")
+        page = self.fetch(f"/?p={post_id}")
+        if title not in page or content not in page:
+            raise StackError("HTTPS 응답에서 방금 저장한 글을 찾지 못했습니다")
+
+        database_value = self.wordpress(
+            "db",
+            "query",
+            f"SELECT post_content FROM wp_posts WHERE ID={post_id}",
+            "--skip-column-names",
+            capture=True,
+        )
+        if content not in database_value:
+            raise StackError("MariaDB 조회 결과가 WordPress 입력과 다릅니다")
+        print(f"isolated end-to-end check passed: project={self.project} port={self.port}")
+
+    def _verify_legacy_config_migration(self) -> None:
+        self.run_compose("stop", "nginx", "wordpress")
+        self.run_compose(
+            "run",
+            "--rm",
+            "--no-TTY",
+            "--no-deps",
+            "--entrypoint",
+            "sh",
+            "wordpress",
+            "-ceu",
+            "cp -p /var/www/config/wp-config.php /var/www/html/.wp-config.legacy; "
+            "rm -f /var/www/html/wp-config.php /var/www/config/wp-config.php; "
+            "mv /var/www/html/.wp-config.legacy /var/www/html/wp-config.php",
+        )
+        self._run_start("application")
+        migrated = self.run_compose(
+            "exec",
+            "--no-TTY",
+            "wordpress",
+            "sh",
+            "-ceu",
+            "test -L /var/www/html/wp-config.php; "
+            "test \"$(readlink /var/www/html/wp-config.php)\" = "
+            "/var/www/config/wp-config.php; "
+            "test -f /var/www/config/wp-config.php; "
+            "test \"$(stat -c %a /var/www/config/wp-config.php)\" = 600",
+            capture=True,
+            check=False,
+        )
+        if migrated.returncode != 0:
+            raise StackError("기존 WordPress 설정을 전용 볼륨으로 옮기지 못했습니다")
 
     def collect_diagnostics(self) -> Path:
         destination = self.diagnostics_dir
@@ -392,7 +488,7 @@ class RuntimeStack:
 
 def parse_arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="격리된 컨테이너 스택 검증")
-    parser.add_argument("scenario", choices=("bootstrap",))
+    parser.add_argument("scenario", choices=("bootstrap", "e2e"))
     parser.add_argument("--keep", action="store_true", help="검사 뒤 프로젝트를 유지합니다")
     parser.add_argument("--diagnostics-dir", type=Path)
     return parser.parse_args()
@@ -416,7 +512,10 @@ def main() -> int:
 
     failed = True
     try:
-        stack.verify_bootstrap()
+        if args.scenario == "bootstrap":
+            stack.verify_bootstrap()
+        else:
+            stack.verify_e2e()
         failed = False
         return 0
     except (OSError, StackError, subprocess.SubprocessError) as error:
