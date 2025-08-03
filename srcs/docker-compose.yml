@@ -8,13 +8,12 @@ services:
   nginx:
     build:
       context: ./requirements/nginx
-    image: inception-nginx:local
-    container_name: inception-nginx
+    image: ${STACK_IMAGE_PREFIX:-container-stack}-nginx:${STACK_IMAGE_TAG:-local}
     restart: unless-stopped
     environment:
       DOMAIN_NAME: ${DOMAIN_NAME:?set DOMAIN_NAME}
     ports:
-      - "443:443"
+      - "${HTTPS_BIND_ADDRESS:-127.0.0.1}:${HTTPS_PORT:-443}:443"
     volumes:
       - wordpress_data:/var/www/html:ro
     depends_on:
@@ -32,8 +31,7 @@ services:
   mariadb:
     build:
       context: ./requirements/mariadb
-    image: inception-mariadb:local
-    container_name: inception-mariadb
+    image: ${STACK_IMAGE_PREFIX:-container-stack}-mariadb:${STACK_IMAGE_TAG:-local}
     restart: unless-stopped
     environment:
       MYSQL_DATABASE: ${MYSQL_DATABASE:?set MYSQL_DATABASE}
@@ -52,11 +50,11 @@ services:
   wordpress:
     build:
       context: ./requirements/wordpress
-    image: inception-wordpress:local
-    container_name: inception-wordpress
+    image: ${STACK_IMAGE_PREFIX:-container-stack}-wordpress:${STACK_IMAGE_TAG:-local}
     restart: unless-stopped
     environment:
       DOMAIN_NAME: ${DOMAIN_NAME:?set DOMAIN_NAME}
+      WORDPRESS_URL: ${WORDPRESS_URL:?set WORDPRESS_URL}
       WORDPRESS_DB_HOST: mariadb
       MYSQL_DATABASE: ${MYSQL_DATABASE:?set MYSQL_DATABASE}
       MYSQL_USER: ${MYSQL_USER:?set MYSQL_USER}
