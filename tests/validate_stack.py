@@ -178,6 +178,15 @@ def validate_tools() -> None:
             r"^start-application:",
             r"^smoke:",
             r"tools/smoke_https\.sh",
+            r"^bootstrap-test:",
+            r"runtime_stack\.py bootstrap",
+        ],
+    )
+    require_text(
+        "tests/runtime_stack.py",
+        [
+            r"--project-name",
+            r"tools.+start_stack\.py",
         ],
     )
 
