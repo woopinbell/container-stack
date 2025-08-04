@@ -3,3 +3,5 @@ secrets/*.txt
 *.log
 *.pid
 .DS_Store
+__pycache__/
+*.py[cod]
