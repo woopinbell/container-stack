@@ -182,6 +182,8 @@ def validate_tools() -> None:
             r"runtime_stack\.py bootstrap",
             r"^e2e:",
             r"runtime_stack\.py e2e",
+            r"^persistence:",
+            r"runtime_stack\.py persistence",
         ],
     )
     require_text(
@@ -192,6 +194,8 @@ def validate_tools() -> None:
             r'"post",\s*\n\s*"create"',
             r"tools.+start_stack\.py",
             r'"bootstrap",\s*"e2e"',
+            r"def verify_persistence",
+            r"len\(initial_volumes\) != 3",
         ],
     )
 

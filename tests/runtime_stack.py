@@ -233,6 +233,24 @@ class RuntimeStack:
         )
         return result.stdout.strip() if capture else ""
 
+    def project_volumes(self) -> set[str]:
+        result = subprocess.run(
+            [
+                "docker",
+                "volume",
+                "ls",
+                "--filter",
+                f"label=com.docker.compose.project={self.project}",
+                "--format",
+                "{{.Name}}",
+            ],
+            check=True,
+            text=True,
+            capture_output=True,
+            timeout=PROCESS_TIMEOUT_SECONDS,
+        )
+        return {line for line in result.stdout.splitlines() if line}
+
     def inspect_service(self, service: str) -> dict[str, object]:
         container_id = self.run_compose(
             "ps", "--quiet", service, capture=True
@@ -447,6 +465,78 @@ class RuntimeStack:
         if migrated.returncode != 0:
             raise StackError("기존 WordPress 설정을 전용 볼륨으로 옮기지 못했습니다")
 
+    def _verify_persistent_values(
+        self, *, post_id: str, title: str, content: str, filename: str, file_value: str
+    ) -> None:
+        page = self.fetch(f"/?p={post_id}")
+        if title not in page or content not in page:
+            raise StackError("재기동 뒤 게시물 내용이 보존되지 않았습니다")
+        option = self.wordpress(
+            "option", "get", "container_stack_persistence", capture=True
+        )
+        if option != content:
+            raise StackError("재기동 뒤 WordPress 옵션 값이 보존되지 않았습니다")
+        if self.fetch(f"/wp-content/uploads/{filename}") != file_value:
+            raise StackError("재기동 뒤 업로드 파일이 보존되지 않았습니다")
+
+    def verify_persistence(self) -> None:
+        self.start()
+        nonce = secrets.token_hex(8)
+        title = f"영속성 검증 {nonce}"
+        content = f"persistent-database-{nonce}"
+        filename = f"persistence-{nonce}.txt"
+        file_value = f"persistent-volume-{nonce}\n"
+        post_id = self.wordpress(
+            "post",
+            "create",
+            f"--post_title={title}",
+            f"--post_content={content}",
+            "--post_status=publish",
+            "--porcelain",
+            capture=True,
+        )
+        self.wordpress("option", "update", "container_stack_persistence", content)
+        php_value = file_value.replace("\\", "\\\\").replace('"', '\\"').replace("$", "\\$")
+        php_file = filename.replace('"', '\\"')
+        self.wordpress(
+            "eval",
+            "wp_mkdir_p(WP_CONTENT_DIR . '/uploads'); "
+            f'file_put_contents(WP_CONTENT_DIR . "/uploads/{php_file}", "{php_value}");',
+        )
+        initial_volumes = self.project_volumes()
+        if len(initial_volumes) != 3:
+            raise StackError(f"예상한 영구 볼륨 세 개를 찾지 못했습니다: {initial_volumes}")
+        self._verify_persistent_values(
+            post_id=post_id,
+            title=title,
+            content=content,
+            filename=filename,
+            file_value=file_value,
+        )
+
+        self.run_compose("restart", "mariadb", "wordpress", "nginx")
+        self.run_compose("up", "--detach", "--wait", "--wait-timeout", "240")
+        self._verify_persistent_values(
+            post_id=post_id,
+            title=title,
+            content=content,
+            filename=filename,
+            file_value=file_value,
+        )
+
+        self.run_compose("down", "--remove-orphans", "--timeout", "20")
+        self.run_compose("up", "--detach", "--wait", "--wait-timeout", "240")
+        if self.project_volumes() != initial_volumes:
+            raise StackError("서비스 재생성 과정에서 영구 볼륨이 교체되었습니다")
+        self._verify_persistent_values(
+            post_id=post_id,
+            title=title,
+            content=content,
+            filename=filename,
+            file_value=file_value,
+        )
+        print(f"restart and recreation persistence passed: project={self.project}")
+
     def collect_diagnostics(self) -> Path:
         destination = self.diagnostics_dir
         if destination is None:
@@ -488,7 +578,7 @@ class RuntimeStack:
 
 def parse_arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="격리된 컨테이너 스택 검증")
-    parser.add_argument("scenario", choices=("bootstrap", "e2e"))
+    parser.add_argument("scenario", choices=("bootstrap", "e2e", "persistence"))
     parser.add_argument("--keep", action="store_true", help="검사 뒤 프로젝트를 유지합니다")
     parser.add_argument("--diagnostics-dir", type=Path)
     return parser.parse_args()
@@ -514,6 +604,8 @@ def main() -> int:
     try:
         if args.scenario == "bootstrap":
             stack.verify_bootstrap()
+        elif args.scenario == "persistence":
+            stack.verify_persistence()
         else:
             stack.verify_e2e()
         failed = False

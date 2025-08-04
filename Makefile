@@ -6,7 +6,7 @@ WAIT_TIMEOUT ?= 300
 
 COMPOSE_RUN := $(COMPOSE) --project-name $(PROJECT_NAME) --env-file $(ENV_FILE) -f $(COMPOSE_FILE)
 
-.PHONY: up start-database start-application down build logs ps clean fclean test config smoke bootstrap-test e2e
+.PHONY: up start-database start-application down build logs ps clean fclean test config smoke bootstrap-test e2e persistence
 
 up:
 	python3 tools/start_stack.py start --project "$(PROJECT_NAME)" --env-file "$(ENV_FILE)" --wait-timeout "$(WAIT_TIMEOUT)"
@@ -54,3 +54,6 @@ bootstrap-test:
 
 e2e:
 	python3 tests/runtime_stack.py e2e
+
+persistence:
+	python3 tests/runtime_stack.py persistence
