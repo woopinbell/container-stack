@@ -17,6 +17,8 @@ import tarfile
 import time
 from typing import BinaryIO, Iterator
 
+from stack_runtime import secret_payload
+
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_COMPOSE_FILE = ROOT / "srcs" / "docker-compose.yml"
@@ -301,3 +303,61 @@ def project_operation_lock(project_name: str) -> Iterator[None]:
         if lock_descriptor is not None:
             os.close(lock_descriptor)
         os.close(directory_descriptor)
+
+
+def validate_database_dump(path: Path) -> None:
+    with path.open("rb") as stream:
+        prefix = stream.read(1024 * 1024)
+    if not prefix.startswith(b"/*M!") and b"CREATE DATABASE" not in prefix:
+        raise BackupError("MariaDB 덤프가 예상한 SQL 형식이 아닙니다")
+
+
+def database_dump(
+    project: ComposeProject, destination: Path, root_password: str
+) -> None:
+    with private_output(destination) as output:
+        project.run(
+            "exec",
+            "--no-TTY",
+            "mariadb",
+            "sh",
+            "-ceu",
+            "umask 077; auth=\"$(mktemp /run/container-stack-dump.XXXXXX)\"; "
+            "trap 'rm -f -- \"$auth\"' EXIT HUP INT TERM; "
+            "IFS= read -r password; "
+            "printf '[client]\\npassword=\"%s\"\\n' \"$password\" >\"$auth\"; "
+            "mariadb-dump --defaults-extra-file=\"$auth\" "
+            "--socket=/run/mysqld/mysqld.sock -uroot --single-transaction "
+            "--routines --events --triggers --hex-blob --add-drop-database "
+            "--databases \"$MYSQL_DATABASE\"",
+            input_data=secret_payload(root_password),
+            output_stream=output,
+            timeout=TRANSFER_TIMEOUT_SECONDS,
+        )
+    validate_database_dump(destination)
+
+
+def wordpress_archive(project: ComposeProject, destination: Path) -> None:
+    with private_output(destination) as output:
+        project.run(
+            "run",
+            "--rm",
+            "--no-TTY",
+            "--no-deps",
+            "--entrypoint",
+            "tar",
+            "wordpress",
+            "-C",
+            "/var/www",
+            "-czf",
+            "-",
+            "--exclude=html/wp-config.php",
+            "html",
+            "config",
+            output_stream=output,
+            timeout=TRANSFER_TIMEOUT_SECONDS,
+        )
+    with destination.open("rb") as stream:
+        magic = stream.read(2)
+    if magic != b"\x1f\x8b":
+        raise BackupError("WordPress 볼륨 아카이브가 gzip 형식이 아닙니다")
