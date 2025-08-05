@@ -361,3 +361,30 @@ def wordpress_archive(project: ComposeProject, destination: Path) -> None:
         magic = stream.read(2)
     if magic != b"\x1f\x8b":
         raise BackupError("WordPress 볼륨 아카이브가 gzip 형식이 아닙니다")
+
+
+def normalize_backup_output(requested: Path) -> Path:
+    expanded = requested.expanduser()
+    if not expanded.is_absolute():
+        expanded = Path.cwd() / expanded
+    if expanded.name in ("", ".", ".."):
+        raise BackupError("백업 출력 이름이 올바르지 않습니다")
+    try:
+        parent = expanded.parent.resolve(strict=True)
+    except OSError as error:
+        raise BackupError("백업 출력의 상위 디렉터리가 없습니다") from error
+    if not parent.is_dir():
+        raise BackupError("백업 출력의 상위 경로가 디렉터리가 아닙니다")
+    return parent / expanded.name
+
+
+def same_directory(path: Path, expected: os.stat_result) -> bool:
+    try:
+        actual = os.lstat(path)
+    except FileNotFoundError:
+        return False
+    return (
+        stat.S_ISDIR(actual.st_mode)
+        and actual.st_dev == expected.st_dev
+        and actual.st_ino == expected.st_ino
+    )
