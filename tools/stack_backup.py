@@ -4,24 +4,34 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+from datetime import datetime, timezone
 import fcntl
 import hashlib
 import json
 import os
 from pathlib import Path, PurePosixPath
 import re
+import shutil
 import signal
 import stat
 import subprocess
 import tarfile
+import tempfile
 import time
 from typing import BinaryIO, Iterator
 
-from stack_runtime import secret_payload
+from stack_runtime import (
+    load_secret_values,
+    secret_payload,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_COMPOSE_FILE = ROOT / "srcs" / "docker-compose.yml"
+DATABASE_DUMP = "database.sql"
+WORDPRESS_ARCHIVE = "wordpress.tar.gz"
+MANIFEST = "manifest.json"
+EXPECTED_FILES = {DATABASE_DUMP, WORDPRESS_ARCHIVE, MANIFEST}
 PROJECT_PATTERN = re.compile(r"^[a-z0-9][a-z0-9_-]{2,62}$")
 FAILURE_STAGES = ("database-dump", "database-restore")
 PAUSE_STAGES = ("backup-stop", "database-restore")
@@ -388,3 +398,137 @@ def same_directory(path: Path, expected: os.stat_result) -> bool:
         and actual.st_dev == expected.st_dev
         and actual.st_ino == expected.st_ino
     )
+
+
+def _create_backup(
+    project: ComposeProject,
+    output: Path,
+    failure_stage: str | None = None,
+    pause_stage: str | None = None,
+    pause_ready_file: Path | None = None,
+) -> None:
+    secrets = load_secret_values(project)
+    running = project.running_services()
+    expected_services = {"mariadb", "wordpress", "nginx"}
+    if running != expected_services:
+        raise BackupError(
+            "백업은 세 서비스가 모두 실행 중일 때만 시작할 수 있습니다: "
+            f"{sorted(running)}"
+        )
+    output = normalize_backup_output(output)
+    try:
+        output.mkdir(mode=0o700)
+    except FileExistsError as error:
+        raise BackupError("백업 출력 경로가 이미 존재합니다") from error
+    reservation = os.lstat(output)
+    fsync_directory(output.parent)
+    temporary: Path | None = None
+    published = False
+    stopped = False
+    original_error: BaseException | None = None
+    try:
+        temporary = Path(
+            tempfile.mkdtemp(prefix=f".{output.name}.tmp-", dir=str(output.parent))
+        )
+        stopped = True
+        project.run(
+            "stop",
+            "nginx",
+            "wordpress",
+            timeout=CONTROL_TIMEOUT_SECONDS,
+        )
+        pause_for_test(pause_stage, "backup-stop", pause_ready_file)
+        database_dump(
+            project,
+            temporary / DATABASE_DUMP,
+            secrets["db_root_password"],
+        )
+        maybe_fail(failure_stage, "database-dump")
+        wordpress_archive(project, temporary / WORDPRESS_ARCHIVE)
+        manifest = {
+            "format": 1,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "project": project.project,
+            "sha256": {
+                DATABASE_DUMP: sha256(temporary / DATABASE_DUMP),
+                WORDPRESS_ARCHIVE: sha256(temporary / WORDPRESS_ARCHIVE),
+            },
+        }
+        write_private(
+            temporary / MANIFEST,
+            (json.dumps(manifest, ensure_ascii=False, indent=2) + "\n").encode(),
+        )
+        validate_archive(temporary / WORDPRESS_ARCHIVE)
+        fsync_directory(temporary)
+        if not same_directory(output, reservation) or any(output.iterdir()):
+            raise BackupError("백업 출력 예약 경로가 변경되었습니다")
+        os.replace(temporary, output)
+        published = True
+        fsync_directory(output.parent)
+        project.run(
+            "up",
+            "--detach",
+            "--wait",
+            "--wait-timeout",
+            "240",
+            timeout=CONTROL_TIMEOUT_SECONDS,
+        )
+        stopped = False
+    except BaseException as error:
+        original_error = error
+        raise
+    finally:
+        recovery_error = ""
+        if stopped:
+            try:
+                result = project.run(
+                    "up",
+                    "--detach",
+                    "--wait",
+                    "--wait-timeout",
+                    "240",
+                    capture=True,
+                    check=False,
+                    timeout=CONTROL_TIMEOUT_SECONDS,
+                )
+                if result.returncode != 0:
+                    recovery_error = (
+                        result.stderr.decode(errors="replace").strip()
+                        or "docker compose up이 실패했습니다"
+                    )
+            except BackupError as error:
+                recovery_error = str(error)
+        if temporary is not None and temporary.exists():
+            shutil.rmtree(temporary)
+        reservation_removed = False
+        if not published and same_directory(output, reservation):
+            try:
+                output.rmdir()
+                reservation_removed = True
+            except OSError:
+                pass
+        if reservation_removed:
+            fsync_directory(output.parent)
+        if recovery_error:
+            raise BackupError(
+                f"백업 작업 뒤 서비스를 복구하지 못했습니다: {recovery_error}"
+            ) from original_error
+    print(f"백업을 생성했습니다: {output}")
+
+
+def create_backup(
+    project: ComposeProject,
+    output: Path,
+    failure_stage: str | None = None,
+    pause_stage: str | None = None,
+    pause_ready_file: Path | None = None,
+) -> None:
+    with operation_signal_handlers():
+        with project_operation_lock(project.project):
+            _create_backup(
+                project,
+                output,
+                failure_stage,
+                pause_stage,
+                pause_ready_file,
+            )
