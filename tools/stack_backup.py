@@ -7,10 +7,11 @@ from contextlib import contextmanager
 import hashlib
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import re
 import signal
 import subprocess
+import tarfile
 import time
 from typing import BinaryIO, Iterator
 
@@ -221,3 +222,32 @@ class ComposeProject:
             for line in result.stdout.decode(errors="replace").splitlines()
             if line
         }
+
+
+def validate_archive_stream(stream: BinaryIO) -> None:
+    try:
+        stream.seek(0)
+        with tarfile.open(fileobj=stream, mode="r:gz") as archive:
+            members = archive.getmembers()
+            if not members:
+                raise BackupError("WordPress 아카이브가 비어 있습니다")
+            seen: set[str] = set()
+            for member in members:
+                member_path = PurePosixPath(member.name)
+                if member_path.is_absolute() or ".." in member_path.parts:
+                    raise BackupError(f"안전하지 않은 아카이브 경로입니다: {member.name}")
+                normalized = member_path.as_posix()
+                if normalized in seen:
+                    raise BackupError(f"중복된 아카이브 경로입니다: {member.name}")
+                seen.add(normalized)
+                if not (member.isdir() or member.isfile()):
+                    raise BackupError(f"지원하지 않는 아카이브 항목입니다: {member.name}")
+    except (tarfile.TarError, OSError) as error:
+        raise BackupError(f"WordPress 아카이브를 읽을 수 없습니다: {error}") from error
+    finally:
+        stream.seek(0)
+
+
+def validate_archive(path: Path) -> None:
+    with path.open("rb") as stream:
+        validate_archive_stream(stream)
