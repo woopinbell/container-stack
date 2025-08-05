@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import argparse
 from contextlib import contextmanager
 from datetime import datetime, timezone
 import fcntl
@@ -15,12 +16,14 @@ import shutil
 import signal
 import stat
 import subprocess
+import sys
 import tarfile
 import tempfile
 import time
 from typing import BinaryIO, Iterator
 
 from stack_runtime import (
+    StackRuntimeError,
     load_secret_values,
     secret_payload,
 )
@@ -532,3 +535,38 @@ def create_backup(
                 pause_stage,
                 pause_ready_file,
             )
+
+
+def parse_arguments() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="컨테이너 스택 백업")
+    parser.add_argument("operation", choices=("backup",))
+    parser.add_argument("--project", required=True)
+    parser.add_argument("--env-file", type=Path, required=True)
+    parser.add_argument("--compose-file", type=Path, default=DEFAULT_COMPOSE_FILE)
+    parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--fail-after", choices=("database-dump",), help=argparse.SUPPRESS)
+    parser.add_argument("--pause-after", choices=("backup-stop",), help=argparse.SUPPRESS)
+    parser.add_argument("--pause-ready-file", type=Path, help=argparse.SUPPRESS)
+    return parser.parse_args()
+
+
+def main() -> int:
+    args = parse_arguments()
+    if shutil.which("docker") is None:
+        print("docker 명령을 찾을 수 없습니다", file=sys.stderr)
+        return 2
+    try:
+        if (args.pause_after is None) != (args.pause_ready_file is None):
+            raise BackupError("일시정지 단계와 준비 파일을 함께 지정해야 합니다")
+        project = ComposeProject(args.project, args.env_file, args.compose_file)
+        create_backup(
+            project, args.output, args.fail_after, args.pause_after, args.pause_ready_file
+        )
+        return 0
+    except (BackupError, StackRuntimeError, OSError, subprocess.SubprocessError) as error:
+        print(f"backup 실패: {error}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
