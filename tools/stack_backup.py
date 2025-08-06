@@ -383,6 +383,113 @@ def validate_archive(path: Path) -> None:
         validate_archive_stream(stream)
 
 
+class VerifiedBackup:
+    def __init__(
+        self,
+        directory_descriptor: int,
+        database: BinaryIO,
+        wordpress: BinaryIO,
+        manifest: dict[str, object],
+    ) -> None:
+        self.directory_descriptor = directory_descriptor
+        self.database = database
+        self.wordpress = wordpress
+        self.manifest = manifest
+
+    def __enter__(self) -> "VerifiedBackup":
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        self.database.close()
+        self.wordpress.close()
+        os.close(self.directory_descriptor)
+
+
+def open_regular_file(directory_descriptor: int, filename: str) -> BinaryIO:
+    try:
+        descriptor = os.open(
+            filename,
+            os.O_RDONLY | NOFOLLOW | NONBLOCK,
+            dir_fd=directory_descriptor,
+        )
+    except OSError as error:
+        raise BackupError(f"백업 파일을 안전하게 열 수 없습니다: {filename}") from error
+    info = os.fstat(descriptor)
+    if (
+        not stat.S_ISREG(info.st_mode)
+        or info.st_nlink != 1
+        or info.st_uid != os.getuid()
+        or stat.S_IMODE(info.st_mode) & 0o077
+    ):
+        os.close(descriptor)
+        raise BackupError(f"백업 항목의 형식이나 권한이 안전하지 않습니다: {filename}")
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_SH | fcntl.LOCK_NB)
+    except OSError as error:
+        os.close(descriptor)
+        raise BackupError(f"다른 작업이 백업 파일을 변경하고 있습니다: {filename}") from error
+    return os.fdopen(descriptor, "rb")
+
+
+def load_and_verify_backup(source: Path) -> VerifiedBackup:
+    source = source.expanduser()
+    if not source.is_absolute():
+        source = Path.cwd() / source
+    try:
+        directory_descriptor = os.open(
+            source,
+            os.O_RDONLY | DIRECTORY | NOFOLLOW,
+        )
+    except OSError as error:
+        raise BackupError("백업 입력은 심볼릭 링크가 아닌 디렉터리여야 합니다") from error
+    opened: list[BinaryIO] = []
+    try:
+        directory_info = os.fstat(directory_descriptor)
+        if (
+            not stat.S_ISDIR(directory_info.st_mode)
+            or directory_info.st_uid != os.getuid()
+            or stat.S_IMODE(directory_info.st_mode) & 0o077
+        ):
+            raise BackupError("백업 입력 디렉터리의 형식이나 권한이 안전하지 않습니다")
+        present = set(os.listdir(directory_descriptor))
+        if present != EXPECTED_FILES:
+            raise BackupError(f"백업 파일 구성이 올바르지 않습니다: {sorted(present)}")
+        manifest_stream = open_regular_file(directory_descriptor, MANIFEST)
+        opened.append(manifest_stream)
+        if os.fstat(manifest_stream.fileno()).st_size > 64 * 1024:
+            raise BackupError("백업 manifest가 허용 크기를 넘었습니다")
+        try:
+            manifest = json.loads(manifest_stream.read().decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise BackupError(f"백업 manifest를 읽을 수 없습니다: {error}") from error
+        if not isinstance(manifest, dict) or manifest.get("format") != 1:
+            raise BackupError("지원하지 않는 백업 형식입니다")
+        checksums = manifest.get("sha256")
+        if not isinstance(checksums, dict):
+            raise BackupError("백업 manifest에 체크섬이 없습니다")
+        database = open_regular_file(directory_descriptor, DATABASE_DUMP)
+        opened.append(database)
+        wordpress = open_regular_file(directory_descriptor, WORDPRESS_ARCHIVE)
+        opened.append(wordpress)
+        for filename, stream in (
+            (DATABASE_DUMP, database),
+            (WORDPRESS_ARCHIVE, wordpress),
+        ):
+            expected = checksums.get(filename)
+            actual = sha256_stream(stream)
+            if not isinstance(expected, str) or expected != actual:
+                raise BackupError(f"백업 체크섬이 일치하지 않습니다: {filename}")
+        validate_archive_stream(wordpress)
+        manifest_stream.close()
+        opened.remove(manifest_stream)
+        return VerifiedBackup(directory_descriptor, database, wordpress, manifest)
+    except Exception:
+        for stream in opened:
+            stream.close()
+        os.close(directory_descriptor)
+        raise
+
+
 @contextmanager
 def project_operation_lock(project_name: str) -> Iterator[None]:
     lock_directory = Path("/tmp") / f"container-stack-operation-locks-{os.getuid()}"
