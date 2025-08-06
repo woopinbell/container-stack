@@ -27,6 +27,7 @@ from stack_runtime import (
     load_secret_values,
     secret_payload,
 )
+from start_stack import start_application, start_database
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -755,6 +756,48 @@ def create_backup(
                 pause_stage,
                 pause_ready_file,
             )
+
+
+def restore_database(
+    project: ComposeProject, source: BinaryIO, root_password: str
+) -> None:
+    with tempfile.TemporaryFile(mode="w+b") as payload:
+        payload.write(secret_payload(root_password))
+        shutil.copyfileobj(source, payload, length=1024 * 1024)
+        payload.seek(0)
+        project.run(
+            "exec",
+            "--no-TTY",
+            "mariadb",
+            "sh",
+            "-ceu",
+            "umask 077; auth=\"$(mktemp /run/container-stack-restore.XXXXXX)\"; "
+            "trap 'rm -f -- \"$auth\"' EXIT HUP INT TERM; "
+            "IFS= read -r password; "
+            "printf '[client]\\npassword=\"%s\"\\n' \"$password\" >\"$auth\"; "
+            "mariadb --defaults-extra-file=\"$auth\" "
+            "--socket=/run/mysqld/mysqld.sock -uroot",
+            input_stream=payload,
+            timeout=TRANSFER_TIMEOUT_SECONDS,
+        )
+
+
+def restore_wordpress(project: ComposeProject, source: BinaryIO) -> None:
+    project.run(
+        "run",
+        "--rm",
+        "--no-TTY",
+        "--no-deps",
+        "--entrypoint",
+        "sh",
+        "wordpress",
+        "-ceu",
+        "test -z \"$(find /var/www/html -mindepth 1 -print -quit)\"; "
+        "test -z \"$(find /var/www/config -mindepth 1 -print -quit)\"; "
+        "exec tar -xzf - -C /var/www",
+        input_stream=source,
+        timeout=TRANSFER_TIMEOUT_SECONDS,
+    )
 
 
 def parse_arguments() -> argparse.Namespace:
