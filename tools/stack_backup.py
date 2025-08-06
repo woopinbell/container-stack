@@ -335,6 +335,25 @@ def existing_named_containers(expected: set[str]) -> set[str]:
     return expected.intersection(result.stdout.splitlines())
 
 
+def ensure_fresh_project(project: ComposeProject) -> None:
+    found: dict[str, set[str]] = {}
+    for kind in ("container", "volume", "network"):
+        identifiers = project.labelled_resources(kind)
+        if identifiers:
+            found[kind] = identifiers
+    named_containers = existing_named_containers(expected_container_names(project))
+    if named_containers:
+        found.setdefault("container", set()).update(named_containers)
+    rendered = rendered_resource_names(project)
+    for kind in ("volume", "network"):
+        identifiers = existing_named_resources(kind, rendered[kind])
+        if identifiers:
+            found.setdefault(kind, set()).update(identifiers)
+    if found:
+        summary = ", ".join(f"{kind}={len(items)}" for kind, items in found.items())
+        raise BackupError(f"복원 대상 프로젝트가 비어 있지 않습니다: {summary}")
+
+
 def validate_archive_stream(stream: BinaryIO) -> None:
     try:
         stream.seek(0)
