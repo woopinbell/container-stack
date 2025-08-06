@@ -884,14 +884,16 @@ def restore_backup(
 
 
 def parse_arguments() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="컨테이너 스택 백업")
-    parser.add_argument("operation", choices=("backup",))
+    parser = argparse.ArgumentParser(description="컨테이너 스택 백업·복원")
+    parser.add_argument("operation", choices=("backup", "restore"))
     parser.add_argument("--project", required=True)
     parser.add_argument("--env-file", type=Path, required=True)
     parser.add_argument("--compose-file", type=Path, default=DEFAULT_COMPOSE_FILE)
-    parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--fail-after", choices=("database-dump",), help=argparse.SUPPRESS)
-    parser.add_argument("--pause-after", choices=("backup-stop",), help=argparse.SUPPRESS)
+    paths = parser.add_mutually_exclusive_group(required=True)
+    paths.add_argument("--output", type=Path)
+    paths.add_argument("--input", type=Path)
+    parser.add_argument("--fail-after", choices=FAILURE_STAGES, help=argparse.SUPPRESS)
+    parser.add_argument("--pause-after", choices=PAUSE_STAGES, help=argparse.SUPPRESS)
     parser.add_argument("--pause-ready-file", type=Path, help=argparse.SUPPRESS)
     return parser.parse_args()
 
@@ -905,12 +907,42 @@ def main() -> int:
         if (args.pause_after is None) != (args.pause_ready_file is None):
             raise BackupError("일시정지 단계와 준비 파일을 함께 지정해야 합니다")
         project = ComposeProject(args.project, args.env_file, args.compose_file)
-        create_backup(
-            project, args.output, args.fail_after, args.pause_after, args.pause_ready_file
-        )
+        if args.operation == "backup":
+            if args.output is None:
+                raise BackupError("backup에는 --output이 필요합니다")
+            if args.fail_after not in (None, "database-dump"):
+                raise BackupError("backup에서 사용할 수 없는 실패 주입 단계입니다")
+            if args.pause_after not in (None, "backup-stop"):
+                raise BackupError("backup에서 사용할 수 없는 일시정지 단계입니다")
+            create_backup(
+                project,
+                args.output,
+                args.fail_after,
+                args.pause_after,
+                args.pause_ready_file,
+            )
+        else:
+            if args.input is None:
+                raise BackupError("restore에는 --input이 필요합니다")
+            if args.fail_after not in (None, "database-restore"):
+                raise BackupError("restore에서 사용할 수 없는 실패 주입 단계입니다")
+            if args.pause_after not in (None, "database-restore"):
+                raise BackupError("restore에서 사용할 수 없는 일시정지 단계입니다")
+            restore_backup(
+                project,
+                args.input,
+                args.fail_after,
+                args.pause_after,
+                args.pause_ready_file,
+            )
         return 0
-    except (BackupError, StackRuntimeError, OSError, subprocess.SubprocessError) as error:
-        print(f"backup 실패: {error}", file=sys.stderr)
+    except (
+        BackupError,
+        StackRuntimeError,
+        OSError,
+        subprocess.SubprocessError,
+    ) as error:
+        print(f"{args.operation} 실패: {error}", file=sys.stderr)
         return 1
 
 
