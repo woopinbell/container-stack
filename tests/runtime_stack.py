@@ -875,7 +875,72 @@ class RuntimeStack:
             if ((backup / filename_in_backup).stat().st_mode & 0o077) != 0:
                 raise StackError(f"백업 파일 권한이 안전하지 않습니다: {filename_in_backup}")
 
-        print("backup publication, interruption, and cleanup passed")
+        restored = RuntimeStack(
+            keep=False,
+            diagnostics_dir=self.diagnostics_dir,
+            credential_values=dict(self.credential_values),
+        )
+        restored.started = True
+        restored_failed = True
+        try:
+            unsafe_backup = self.temp / "unsafe-backup"
+            unsafe_backup.mkdir(mode=0o700)
+            for safe_name in ("manifest.json", "wordpress.tar.gz"):
+                shutil.copyfile(backup / safe_name, unsafe_backup / safe_name)
+                (unsafe_backup / safe_name).chmod(0o600)
+            (unsafe_backup / "database.sql").symlink_to(backup / "database.sql")
+            unsafe_result = self._backup_tool(
+                "restore", restored, unsafe_backup, check=False
+            )
+            if (
+                unsafe_result.returncode == 0
+                or "안전하게 열 수 없습니다" not in unsafe_result.stderr
+                or restored.project_resources()
+            ):
+                raise StackError("복원 도구가 백업 내부의 심볼릭 링크를 거부하지 않았습니다")
+
+            failed_restore = self._backup_tool(
+                "restore",
+                restored,
+                backup,
+                fail_after="database-restore",
+                check=False,
+            )
+            if (
+                failed_restore.returncode == 0
+                or "실패 주입: database-restore" not in failed_restore.stderr
+                or restored.project_resources()
+            ):
+                raise StackError("실패한 복원이 프로젝트 자원을 정리하지 못했습니다")
+
+            self._interrupt_backup_tool(
+                "restore",
+                restored,
+                backup,
+                pause_after="database-restore",
+                signum=signal.SIGINT,
+            )
+            remaining_resources = restored.project_resources()
+            if remaining_resources:
+                raise StackError(
+                    "SIGINT로 중단한 복원이 프로젝트 자원을 남겼습니다: "
+                    f"{remaining_resources}"
+                )
+            self._backup_tool("restore", restored, backup)
+            restored._verify_persistent_values(
+                post_id=post_id,
+                title=title,
+                content=content,
+                filename=filename,
+                file_value=file_value,
+            )
+            repeated = self._backup_tool("restore", restored, backup, check=False)
+            if repeated.returncode == 0 or "비어 있지 않습니다" not in repeated.stderr:
+                raise StackError("복원 도구가 사용 중인 프로젝트를 거부하지 않았습니다")
+            restored_failed = False
+        finally:
+            restored.close(failed=restored_failed)
+        print("backup path safety, failure cleanup, fresh restore, and refusal passed")
 
     def collect_diagnostics(self) -> Path:
         destination = self.diagnostics_dir
