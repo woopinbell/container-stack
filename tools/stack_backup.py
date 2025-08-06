@@ -209,6 +209,28 @@ class ComposeProject:
                 f"Compose {operation} 명령이 {timeout}초 안에 끝나지 않았습니다"
             ) from error
 
+    def labelled_resources(self, kind: str) -> set[str]:
+        format_field = "{{.Names}}" if kind == "container" else "{{.Name}}"
+        command = ["docker", kind, "ls"]
+        if kind == "container":
+            command.append("--all")
+        command.extend(
+            (
+                "--filter",
+                f"label=com.docker.compose.project={self.project}",
+                "--format",
+                format_field,
+            )
+        )
+        result = subprocess.run(
+            command,
+            check=True,
+            text=True,
+            capture_output=True,
+            timeout=QUERY_TIMEOUT_SECONDS,
+        )
+        return {line for line in result.stdout.splitlines() if line}
+
     def config(self) -> dict[str, object]:
         result = self.run(
             "config",
@@ -239,6 +261,78 @@ class ComposeProject:
             for line in result.stdout.decode(errors="replace").splitlines()
             if line
         }
+
+
+def rendered_resource_names(project: ComposeProject) -> dict[str, set[str]]:
+    result = project.run(
+        "config",
+        "--format",
+        "json",
+        capture=True,
+        timeout=QUERY_TIMEOUT_SECONDS,
+    )
+    try:
+        config = json.loads(result.stdout)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise BackupError(f"Compose 설정 JSON을 읽을 수 없습니다: {error}") from error
+    if not isinstance(config, dict):
+        raise BackupError("Compose 설정이 객체 형식이 아닙니다")
+
+    names: dict[str, set[str]] = {"volume": set(), "network": set()}
+    for config_key, resource_kind in (("volumes", "volume"), ("networks", "network")):
+        resources = config.get(config_key, {})
+        if not isinstance(resources, dict):
+            raise BackupError(f"Compose {config_key} 설정이 객체 형식이 아닙니다")
+        for resource in resources.values():
+            if not isinstance(resource, dict) or not isinstance(resource.get("name"), str):
+                raise BackupError(f"Compose {resource_kind} 이름을 확인할 수 없습니다")
+            names[resource_kind].add(resource["name"])
+    return names
+
+
+def existing_named_resources(kind: str, expected: set[str]) -> set[str]:
+    if not expected:
+        return set()
+    result = subprocess.run(
+        ["docker", kind, "ls", "--format", "{{.Name}}"],
+        check=True,
+        text=True,
+        capture_output=True,
+        timeout=QUERY_TIMEOUT_SECONDS,
+    )
+    return expected.intersection(result.stdout.splitlines())
+
+
+def expected_container_names(project: ComposeProject) -> set[str]:
+    config = project.config()
+    services = config.get("services")
+    if not isinstance(services, dict):
+        raise BackupError("Compose 서비스 설정을 찾을 수 없습니다")
+    names: set[str] = set()
+    for service, service_config in services.items():
+        if not isinstance(service, str) or not isinstance(service_config, dict):
+            raise BackupError("Compose 서비스 설정 형식이 올바르지 않습니다")
+        configured_name = service_config.get("container_name")
+        if configured_name is not None:
+            if not isinstance(configured_name, str):
+                raise BackupError("Compose 컨테이너 이름이 문자열이 아닙니다")
+            names.add(configured_name)
+        else:
+            names.add(f"{project.project}-{service}-1")
+            names.add(f"{project.project}_{service}_1")
+        names.add(f"{project.project}-{service}-bootstrap")
+    return names
+
+
+def existing_named_containers(expected: set[str]) -> set[str]:
+    result = subprocess.run(
+        ["docker", "container", "ls", "--all", "--format", "{{.Names}}"],
+        check=True,
+        text=True,
+        capture_output=True,
+        timeout=QUERY_TIMEOUT_SECONDS,
+    )
+    return expected.intersection(result.stdout.splitlines())
 
 
 def validate_archive_stream(stream: BinaryIO) -> None:
