@@ -800,6 +800,89 @@ def restore_wordpress(project: ComposeProject, source: BinaryIO) -> None:
     )
 
 
+def cleanup_failed_restore(project: ComposeProject) -> None:
+    result = project.run(
+        "down",
+        "--volumes",
+        "--remove-orphans",
+        "--timeout",
+        "20",
+        capture=True,
+        check=False,
+        timeout=CONTROL_TIMEOUT_SECONDS,
+    )
+    remaining = {
+        kind: project.labelled_resources(kind)
+        for kind in ("container", "volume", "network")
+    }
+    remaining["container"].update(
+        existing_named_containers(expected_container_names(project))
+    )
+    rendered = rendered_resource_names(project)
+    for kind in ("volume", "network"):
+        remaining[kind].update(existing_named_resources(kind, rendered[kind]))
+    remaining = {kind: values for kind, values in remaining.items() if values}
+    if result.returncode != 0 or remaining:
+        detail = result.stderr.decode(errors="replace").strip()
+        raise BackupError(f"실패한 복원 자원을 정리하지 못했습니다: {remaining}; {detail}")
+
+
+def restore_backup(
+    project: ComposeProject,
+    source: Path,
+    failure_stage: str | None = None,
+    pause_stage: str | None = None,
+    pause_ready_file: Path | None = None,
+) -> None:
+    with operation_signal_handlers():
+        with project_operation_lock(project.project):
+            with load_and_verify_backup(source) as backup:
+                ensure_fresh_project(project)
+                secrets = load_secret_values(project)
+                restoration_started = False
+                try:
+                    restoration_started = True
+                    start_database(
+                        project,
+                        secrets,
+                        build=True,
+                        pause_after_stage=None,
+                        pause_ready_file=None,
+                    )
+                    restore_database(
+                        project,
+                        backup.database,
+                        secrets["db_root_password"],
+                    )
+                    pause_for_test(
+                        pause_stage, "database-restore", pause_ready_file
+                    )
+                    maybe_fail(failure_stage, "database-restore")
+                    project.run(
+                        "build",
+                        "wordpress",
+                        timeout=TRANSFER_TIMEOUT_SECONDS,
+                    )
+                    restore_wordpress(project, backup.wordpress)
+                    start_application(
+                        project,
+                        secrets,
+                        build=True,
+                        pause_after_stage=None,
+                        pause_ready_file=None,
+                    )
+                except BaseException as original_error:
+                    if restoration_started:
+                        try:
+                            cleanup_failed_restore(project)
+                        except Exception as cleanup_error:
+                            raise BackupError(
+                                f"복원과 실패 자원 정리가 모두 실패했습니다: {cleanup_error}"
+                            ) from original_error
+                    raise
+    print(f"새 프로젝트에 백업을 복원했습니다: {project.project}")
+
+
 def parse_arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="컨테이너 스택 백업")
     parser.add_argument("operation", choices=("backup",))
