@@ -88,3 +88,42 @@ def atomic_secret_write(path: Path, value: str) -> None:
     finally:
         if temporary.exists():
             temporary.unlink()
+
+
+def compose_config(project: ComposeProject) -> dict[str, object]:
+    result = project.run(
+        "config",
+        "--format",
+        "json",
+        capture=True,
+        timeout=QUERY_TIMEOUT_SECONDS,
+    )
+    try:
+        parsed = json.loads(result.stdout)
+    except json.JSONDecodeError as error:
+        raise RotationError(f"Compose 설정 JSON을 읽을 수 없습니다: {error}") from error
+    if not isinstance(parsed, dict):
+        raise RotationError("Compose 설정이 객체 형식이 아닙니다")
+    return parsed
+
+
+def current_secret_paths(
+    config: dict[str, object], compose_directory: Path
+) -> dict[str, Path]:
+    try:
+        return secret_source_paths(
+            config,
+            compose_directory=compose_directory,
+        )
+    except StackRuntimeError as error:
+        raise RotationError(str(error)) from error
+
+
+def service_environment(config: dict[str, object], service: str) -> dict[str, str]:
+    services = config.get("services")
+    if not isinstance(services, dict) or not isinstance(services.get(service), dict):
+        raise RotationError(f"Compose 서비스를 찾을 수 없습니다: {service}")
+    environment = services[service].get("environment")
+    if not isinstance(environment, dict):
+        raise RotationError(f"서비스 환경 변수를 찾을 수 없습니다: {service}")
+    return {str(key): str(value) for key, value in environment.items()}
