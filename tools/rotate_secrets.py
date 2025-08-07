@@ -159,6 +159,122 @@ def root_sql(
     )
 
 
+PHP_CONFIG = r"""
+$payload = json_decode(stream_get_contents(STDIN), true, 8, JSON_THROW_ON_ERROR);
+$path = '/var/www/config/wp-config.php';
+$text = file_get_contents($path);
+if ($text === false) { fwrite(STDERR, "wp-config read failed\n"); exit(1); }
+if (is_link($path) || !is_file($path)) { fwrite(STDERR, "wp-config is not a regular file\n"); exit(1); }
+$replacement = "define( 'DB_PASSWORD', " . var_export($payload['db_password'], true) . " );";
+$updated = preg_replace("/define\\(\\s*['\"]DB_PASSWORD['\"]\\s*,\\s*.*?\\);/", $replacement, $text, 1, $count);
+if ($updated === null || $count !== 1) { fwrite(STDERR, "DB_PASSWORD definition not found\n"); exit(1); }
+umask(0077);
+$temporary = tempnam(dirname($path), '.wp-config.rotate.');
+if ($temporary === false) { fwrite(STDERR, "temporary file creation failed\n"); exit(1); }
+if (realpath(dirname($temporary)) !== realpath(dirname($path))) {
+    @unlink($temporary); fwrite(STDERR, "temporary file is on another filesystem\n"); exit(1);
+}
+$published = false;
+try {
+    $written = file_put_contents($temporary, $updated, LOCK_EX);
+    if ($written !== strlen($updated)) { throw new RuntimeException('wp-config write failed'); }
+    if (!chmod($temporary, fileperms($path) & 0777)) { throw new RuntimeException('chmod failed'); }
+    if (!chown($temporary, fileowner($path))) { throw new RuntimeException('chown failed'); }
+    if (!chgrp($temporary, filegroup($path))) { throw new RuntimeException('chgrp failed'); }
+    $handle = fopen($temporary, 'rb');
+    if ($handle === false) { throw new RuntimeException('temporary file reopen failed'); }
+    try {
+        if (function_exists('fsync') && !fsync($handle)) { throw new RuntimeException('fsync failed'); }
+    } finally {
+        fclose($handle);
+    }
+    if (!rename($temporary, $path)) { throw new RuntimeException('wp-config publish failed'); }
+    $published = true;
+} finally {
+    if (!$published) { @unlink($temporary); }
+}
+if (!empty($payload['fail_after_write'])) { fwrite(STDERR, "injected post-write failure\n"); exit(9); }
+"""
+
+
+PHP_USER = r"""
+$payload = json_decode(stream_get_contents(STDIN), true, 8, JSON_THROW_ON_ERROR);
+require '/var/www/html/wp-load.php';
+$kind = $payload['kind'];
+if ($kind !== 'admin' && $kind !== 'user') { fwrite(STDERR, "invalid user kind\n"); exit(1); }
+$login = getenv($kind === 'admin' ? 'WORDPRESS_ADMIN_USER' : 'WORDPRESS_USER');
+$account = get_user_by('login', $login);
+if (!$account) { fwrite(STDERR, "WordPress user not found\n"); exit(1); }
+wp_set_password($payload['password'], $account->ID);
+if (!empty($payload['fail_after_write'])) { fwrite(STDERR, "injected post-write failure\n"); exit(9); }
+"""
+
+
+def wordpress_php(
+    project: ComposeProject,
+    code: str,
+    payload: dict[str, object],
+    *,
+    check: bool = True,
+    one_off: bool = False,
+) -> subprocess.CompletedProcess[bytes]:
+    if one_off:
+        arguments = (
+            "run",
+            "--rm",
+            "--no-TTY",
+            "--no-deps",
+            "--entrypoint",
+            "php",
+            "wordpress",
+            "-r",
+            code,
+        )
+    else:
+        arguments = ("exec", "--no-TTY", "wordpress", "php", "-r", code)
+    return project.run(
+        *arguments,
+        input_data=json.dumps(payload).encode(),
+        capture=not check,
+        check=check,
+    )
+
+
+def set_wordpress_user(
+    project: ComposeProject,
+    kind: str,
+    password: str,
+    *,
+    fail_after_write: bool = False,
+    one_off: bool = False,
+) -> None:
+    wordpress_php(
+        project,
+        PHP_USER,
+        {
+            "kind": kind,
+            "password": password,
+            "fail_after_write": fail_after_write,
+        },
+        one_off=one_off,
+    )
+
+
+def set_wordpress_db_config(
+    project: ComposeProject,
+    password: str,
+    *,
+    fail_after_write: bool = False,
+    one_off: bool = False,
+) -> None:
+    wordpress_php(
+        project,
+        PHP_CONFIG,
+        {"db_password": password, "fail_after_write": fail_after_write},
+        one_off=one_off,
+    )
+
+
 def alter_database_passwords(
     project: ComposeProject,
     root_password: str,
