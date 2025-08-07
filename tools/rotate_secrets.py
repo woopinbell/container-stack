@@ -373,3 +373,102 @@ def wordpress_config_matches(project: ComposeProject, password: str) -> bool:
         ).returncode
         == 0
     )
+
+
+def verify_runtime_secret_boundary(
+    project: ComposeProject, secrets: dict[str, str]
+) -> None:
+    forbidden_names = (
+        "MYSQL_ROOT_PASSWORD",
+        "MYSQL_PASSWORD",
+        "WORDPRESS_DB_PASSWORD",
+        "WORDPRESS_ADMIN_PASSWORD",
+        "WORDPRESS_USER_PASSWORD",
+    )
+    observed = ""
+    for service in ("mariadb", "wordpress", "nginx"):
+        container_id = project.run(
+            "ps", "--quiet", service, capture=True, timeout=QUERY_TIMEOUT_SECONDS
+        ).stdout.decode().strip()
+        if not container_id or "\n" in container_id:
+            raise RotationError(f"{service} 컨테이너를 하나로 식별하지 못했습니다")
+        inspected_result = subprocess.run(
+            ["docker", "inspect", container_id],
+            check=True,
+            text=True,
+            capture_output=True,
+            timeout=QUERY_TIMEOUT_SECONDS,
+        )
+        inspected = json.loads(inspected_result.stdout)
+        if not isinstance(inspected, list) or len(inspected) != 1:
+            raise RotationError(f"{service} 컨테이너 정보를 읽지 못했습니다")
+        container = inspected[0]
+        mounts = container.get("Mounts") or []
+        if any(
+            isinstance(mount, dict)
+            and (
+                str(mount.get("Destination", "")) == "/run/secrets"
+                or str(mount.get("Destination", "")).startswith("/run/secrets/")
+            )
+            for mount in mounts
+        ):
+            raise RotationError(f"{service} 런타임에 비밀 파일이 마운트되었습니다")
+        destinations = {
+            str(mount.get("Destination", ""))
+            for mount in mounts
+            if isinstance(mount, dict)
+        }
+        if service == "wordpress" and "/var/www/config" not in destinations:
+            raise RotationError("WordPress 설정 전용 볼륨이 마운트되지 않았습니다")
+        if service == "nginx":
+            if "/var/www/config" in destinations:
+                raise RotationError("nginx가 WordPress 설정 전용 볼륨을 볼 수 있습니다")
+            hidden = project.run(
+                "exec",
+                "--no-TTY",
+                "nginx",
+                "sh",
+                "-ceu",
+                "test -L /var/www/html/wp-config.php; "
+                "test ! -e /var/www/html/wp-config.php; "
+                "test ! -e /var/www/config/wp-config.php",
+                capture=True,
+                check=False,
+                timeout=QUERY_TIMEOUT_SECONDS,
+            )
+            if hidden.returncode != 0:
+                raise RotationError(
+                    "nginx에서 WordPress DB 설정 파일이 격리되지 않았습니다"
+                )
+        config = container.get("Config") or {}
+        environment = config.get("Env") or []
+        environment_text = "\n".join(str(value) for value in environment)
+        if any(name in environment_text for name in forbidden_names):
+            raise RotationError(f"{service} 런타임 환경에 비밀번호 변수가 남았습니다")
+        observed += environment_text
+        process_environment = project.run(
+            "exec",
+            "--no-TTY",
+            service,
+            "sh",
+            "-ceu",
+            "for path in /proc/[0-9]*/environ; do "
+            "test -r \"$path\" || continue; "
+            "tr '\\000' '\\n' <\"$path\" || true; "
+            "done",
+            capture=True,
+            timeout=QUERY_TIMEOUT_SECONDS,
+        ).stdout.decode(errors="replace")
+        if any(name in process_environment for name in forbidden_names):
+            raise RotationError(f"{service} 프로세스 환경에 비밀번호 변수가 남았습니다")
+        observed += process_environment
+        observed += subprocess.run(
+            ["docker", "top", container_id, "-eo", "pid,args"],
+            check=True,
+            text=True,
+            capture_output=True,
+            timeout=QUERY_TIMEOUT_SECONDS,
+        ).stdout
+    for value in secrets.values():
+        if value and value in observed:
+            raise RotationError("런타임 환경이나 프로세스 인자에 비밀값이 남았습니다")
