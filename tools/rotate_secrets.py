@@ -127,3 +127,59 @@ def service_environment(config: dict[str, object], service: str) -> dict[str, st
     if not isinstance(environment, dict):
         raise RotationError(f"서비스 환경 변수를 찾을 수 없습니다: {service}")
     return {str(key): str(value) for key, value in environment.items()}
+
+
+def sql_literal(value: str) -> str:
+    return "'" + value.replace("'", "''") + "'"
+
+
+def root_sql(
+    project: ComposeProject,
+    root_password: str,
+    sql: str,
+    *,
+    check: bool = True,
+) -> subprocess.CompletedProcess[bytes]:
+    payload = root_password.encode() + b"\n" + sql.encode() + b"\n"
+    return project.run(
+        "exec",
+        "--no-TTY",
+        "mariadb",
+        "sh",
+        "-ceu",
+        "umask 077; auth=\"$(mktemp /run/container-stack-root.XXXXXX)\"; "
+        "trap 'rm -f -- \"$auth\"' EXIT HUP INT TERM; "
+        "IFS= read -r password; "
+        "printf '[client]\\npassword=\"%s\"\\n' \"$password\" >\"$auth\"; "
+        "mariadb --defaults-extra-file=\"$auth\" "
+        "--socket=/run/mysqld/mysqld.sock -uroot",
+        input_data=payload,
+        capture=True,
+        check=check,
+    )
+
+
+def alter_database_passwords(
+    project: ComposeProject,
+    root_password: str,
+    database_user: str,
+    *,
+    app_password: str | None = None,
+    new_root_password: str | None = None,
+    fail_after_write: bool = False,
+) -> None:
+    statements = ["SET SESSION sql_mode='NO_BACKSLASH_ESCAPES'", "FLUSH PRIVILEGES"]
+    if app_password is not None:
+        statements.append(
+            f"ALTER USER {sql_literal(database_user)}@'%' IDENTIFIED BY {sql_literal(app_password)}"
+        )
+    if new_root_password is not None:
+        statements.append(
+            "ALTER USER 'root'@'localhost' IDENTIFIED BY " + sql_literal(new_root_password)
+        )
+    statements.append("FLUSH PRIVILEGES")
+    if fail_after_write:
+        statements.append(
+            "SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT='injected rotation failure'"
+        )
+    root_sql(project, root_password, ";\n".join(statements) + ";")
