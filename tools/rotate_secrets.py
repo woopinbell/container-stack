@@ -210,6 +210,26 @@ if (!empty($payload['fail_after_write'])) { fwrite(STDERR, "injected post-write 
 """
 
 
+PHP_PROBE_USER = r"""
+$payload = json_decode(stream_get_contents(STDIN), true, 8, JSON_THROW_ON_ERROR);
+require '/var/www/html/wp-load.php';
+$kind = $payload['kind'];
+$login = getenv($kind === 'admin' ? 'WORDPRESS_ADMIN_USER' : 'WORDPRESS_USER');
+clean_user_cache(get_user_by('login', $login)->ID);
+$account = get_user_by('login', $login);
+if (!$account || !wp_check_password($payload['password'], $account->user_pass, $account->ID)) { exit(1); }
+"""
+
+
+PHP_PROBE_CONFIG = r"""
+$payload = json_decode(stream_get_contents(STDIN), true, 8, JSON_THROW_ON_ERROR);
+$text = file_get_contents('/var/www/config/wp-config.php');
+if ($text === false) { exit(1); }
+$pattern = "/define\\(\\s*['\"]DB_PASSWORD['\"]\\s*,\\s*['\"]([^'\"]*)['\"]\\s*\\);/";
+if (!preg_match($pattern, $text, $matches) || !hash_equals($payload['password'], $matches[1])) { exit(1); }
+"""
+
+
 def wordpress_php(
     project: ComposeProject,
     code: str,
@@ -299,3 +319,57 @@ def alter_database_passwords(
             "SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT='injected rotation failure'"
         )
     root_sql(project, root_password, ";\n".join(statements) + ";")
+
+
+def app_sql(
+    project: ComposeProject,
+    database_user: str,
+    password: str,
+    *,
+    check: bool = True,
+) -> subprocess.CompletedProcess[bytes]:
+    payload = password.encode() + b"\n"
+    return project.run(
+        "exec",
+        "--no-TTY",
+        "wordpress",
+        "sh",
+        "-ceu",
+        "umask 077; auth=\"$(mktemp /run/container-stack-app.XXXXXX)\"; "
+        "trap 'rm -f -- \"$auth\"' EXIT HUP INT TERM; "
+        "IFS= read -r password; "
+        "printf '[client]\\npassword=\"%s\"\\n' \"$password\" >\"$auth\"; "
+        "mariadb --defaults-extra-file=\"$auth\" -hmariadb "
+        f"-u{database_user} \"$MYSQL_DATABASE\" --execute='SELECT 1'",
+        input_data=payload,
+        capture=True,
+        check=check,
+    )
+
+
+def wordpress_password_matches(
+    project: ComposeProject,
+    kind: str,
+    password: str,
+) -> bool:
+    return (
+        wordpress_php(
+            project,
+            PHP_PROBE_USER,
+            {"kind": kind, "password": password},
+            check=False,
+        ).returncode
+        == 0
+    )
+
+
+def wordpress_config_matches(project: ComposeProject, password: str) -> bool:
+    return (
+        wordpress_php(
+            project,
+            PHP_PROBE_CONFIG,
+            {"password": password},
+            check=False,
+        ).returncode
+        == 0
+    )
