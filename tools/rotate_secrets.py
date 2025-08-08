@@ -623,3 +623,102 @@ def rollback_rotation(
     except Exception as error:
         errors.append(f"최종 재기동·검증: {error}")
     return errors, recovered
+
+
+def _rotate(project: ComposeProject, new_secret_dir: Path) -> None:
+    config = compose_config(project)
+    paths = current_secret_paths(config, project.compose_file.parent)
+    canonical_paths = [path.resolve(strict=True) for path in paths.values()]
+    if len(set(canonical_paths)) != len(canonical_paths):
+        raise RotationError("Compose 비밀값 파일 경로는 서로 달라야 합니다")
+    current = {name: read_secret(path, require_owner=True) for name, path in paths.items()}
+    directory = new_secret_dir.expanduser()
+    directory_info = os.lstat(directory)
+    if not stat.S_ISDIR(directory_info.st_mode):
+        raise RotationError("새 비밀값 경로는 일반 디렉터리여야 합니다")
+    if directory_info.st_uid != os.getuid() or stat.S_IMODE(directory_info.st_mode) & 0o077:
+        raise RotationError("새 비밀값 디렉터리는 현재 사용자만 접근할 수 있어야 합니다")
+    replacement = {
+        name: read_secret(directory / filename, require_owner=True)
+        for name, filename in SECRET_FILES.items()
+    }
+    if any(current[name] == replacement[name] for name in SECRET_FILES):
+        raise RotationError("모든 비밀값은 기존 값과 달라야 합니다")
+    mariadb_environment = service_environment(config, "mariadb")
+    database_user = mariadb_environment.get("MYSQL_USER", "")
+    if not NAME_PATTERN.fullmatch(database_user):
+        raise RotationError("MYSQL_USER 형식이 안전하지 않습니다")
+    wordpress_environment = service_environment(config, "wordpress")
+    admin_user = wordpress_environment.get("WORDPRESS_ADMIN_USER", "")
+    regular_user = wordpress_environment.get("WORDPRESS_USER", "")
+    if not admin_user or not regular_user or admin_user == regular_user:
+        raise RotationError("WordPress 관리자와 일반 사용자는 서로 다른 계정이어야 합니다")
+    verify_rotation(project, database_user, current, replacement)
+    blocked = True
+    try:
+        project.run("stop", "nginx")
+        set_wordpress_user(project, "admin", replacement["wp_admin_password"])
+        set_wordpress_user(project, "user", replacement["wp_user_password"])
+        set_wordpress_db_config(project, replacement["db_password"])
+        alter_database_passwords(
+            project, current["db_root_password"], database_user,
+            app_password=replacement["db_password"],
+        )
+        alter_database_passwords(
+            project, current["db_root_password"], database_user,
+            new_root_password=replacement["db_root_password"],
+        )
+        for name, path in paths.items():
+            atomic_secret_write(path, replacement[name])
+        project.run("up", "--detach", "--force-recreate", "--wait", "--wait-timeout", "300")
+        verify_rotation(project, database_user, replacement, current)
+        for name, path in paths.items():
+            if read_secret(path, require_owner=True) != replacement[name]:
+                raise RotationError(f"호스트 비밀 파일 회전 검증 실패: {path.name}")
+        blocked = False
+    except BaseException as original_error:
+        rollback_errors, recovered = rollback_rotation(
+            project, paths, current, replacement, database_user
+        )
+        if recovered:
+            blocked = False
+        detail = "롤백 완료" if recovered else "롤백 불완전"
+        if rollback_errors:
+            detail += ": " + "; ".join(rollback_errors)
+        raise RotationError(f"회전 실패 ({original_error}); {detail}") from original_error
+    finally:
+        if blocked:
+            project.run("up", "--detach", check=False)
+    print("비밀값 회전과 재검증을 완료했습니다")
+
+
+def rotate(project: ComposeProject, new_secret_dir: Path) -> None:
+    with project_operation_lock(project.project):
+        _rotate(project, new_secret_dir)
+
+
+def parse_arguments() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="컨테이너 스택 비밀값 회전")
+    parser.add_argument("--project", required=True)
+    parser.add_argument("--env-file", type=Path, required=True)
+    parser.add_argument("--compose-file", type=Path, default=DEFAULT_COMPOSE_FILE)
+    parser.add_argument("--new-secrets-dir", type=Path, required=True)
+    return parser.parse_args()
+
+
+def main() -> int:
+    args = parse_arguments()
+    if shutil.which("docker") is None:
+        print("docker 명령을 찾을 수 없습니다", file=sys.stderr)
+        return 2
+    try:
+        project = ComposeProject(args.project, args.env_file, args.compose_file)
+        rotate(project, args.new_secrets_dir)
+        return 0
+    except (BackupError, RotationError, OSError, subprocess.SubprocessError) as error:
+        print(f"비밀값 회전 실패: {error}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
