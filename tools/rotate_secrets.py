@@ -472,3 +472,59 @@ def verify_runtime_secret_boundary(
     for value in secrets.values():
         if value and value in observed:
             raise RotationError("런타임 환경이나 프로세스 인자에 비밀값이 남았습니다")
+
+
+def verify_rotation(
+    project: ComposeProject,
+    database_user: str,
+    secrets: dict[str, str],
+    rejected: dict[str, str] | None = None,
+) -> None:
+    boundary_values = dict(secrets)
+    if rejected is not None:
+        boundary_values.update(
+            {f"rejected_{name}": value for name, value in rejected.items()}
+        )
+    verify_runtime_secret_boundary(project, boundary_values)
+    root_sql(project, secrets["db_root_password"], "SELECT 1;")
+    app_sql(project, database_user, secrets["db_password"])
+    if not wordpress_config_matches(project, secrets["db_password"]):
+        raise RotationError("wp-config.php의 DB 비밀번호가 예상 상태와 다릅니다")
+    for kind, secret_name in (
+        ("admin", "wp_admin_password"),
+        ("user", "wp_user_password"),
+    ):
+        if not wordpress_password_matches(project, kind, secrets[secret_name]):
+            raise RotationError(f"WordPress {kind} 비밀번호가 예상 상태와 다릅니다")
+    if rejected is not None:
+        if root_sql(
+            project, rejected["db_root_password"], "SELECT 1;", check=False
+        ).returncode == 0:
+            raise RotationError("거부되어야 할 DB root 비밀번호가 동작합니다")
+        if app_sql(
+            project,
+            database_user,
+            rejected["db_password"],
+            check=False,
+        ).returncode == 0:
+            raise RotationError("거부되어야 할 DB 애플리케이션 비밀번호가 동작합니다")
+        for kind, secret_name in (
+            ("admin", "wp_admin_password"),
+            ("user", "wp_user_password"),
+        ):
+            if wordpress_password_matches(project, kind, rejected[secret_name]):
+                raise RotationError(f"거부되어야 할 WordPress {kind} 비밀번호가 동작합니다")
+
+
+def find_root_password(
+    project: ComposeProject,
+    candidates: tuple[str, ...],
+) -> str | None:
+    attempted: set[str] = set()
+    for candidate in candidates:
+        if candidate in attempted:
+            continue
+        attempted.add(candidate)
+        if root_sql(project, candidate, "SELECT 1;", check=False).returncode == 0:
+            return candidate
+    return None
