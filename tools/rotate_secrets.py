@@ -528,3 +528,98 @@ def find_root_password(
         if root_sql(project, candidate, "SELECT 1;", check=False).returncode == 0:
             return candidate
     return None
+
+
+def rollback_rotation(
+    project: ComposeProject,
+    paths: dict[str, Path],
+    current: dict[str, str],
+    replacement: dict[str, str],
+    database_user: str,
+) -> tuple[list[str], bool]:
+    errors: list[str] = []
+    result = project.run(
+        "up",
+        "--detach",
+        "--no-recreate",
+        "--wait",
+        "--wait-timeout",
+        "180",
+        "mariadb",
+        capture=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        detail = result.stderr.decode(errors="replace").strip()
+        errors.append(f"서비스 준비: {detail or 'docker compose up 실패'}")
+
+    root_auth = find_root_password(
+        project,
+        (replacement["db_root_password"], current["db_root_password"]),
+    )
+    if root_auth is None:
+        errors.append("DB 계정: 사용할 수 있는 root 자격증명을 찾지 못했습니다")
+    else:
+        try:
+            alter_database_passwords(
+                project,
+                root_auth,
+                database_user,
+                app_password=current["db_password"],
+            )
+        except Exception as error:
+            errors.append(f"DB 애플리케이션 계정: {error}")
+
+    try:
+        set_wordpress_db_config(
+            project,
+            current["db_password"],
+            one_off=True,
+        )
+    except Exception as error:
+        errors.append(f"WordPress DB 설정: {error}")
+
+    for kind, secret_name in (
+        ("admin", "wp_admin_password"),
+        ("user", "wp_user_password"),
+    ):
+        try:
+            set_wordpress_user(
+                project,
+                kind,
+                current[secret_name],
+                one_off=True,
+            )
+        except Exception as error:
+            errors.append(f"WordPress {kind} 계정: {error}")
+
+    if root_auth is not None:
+        try:
+            alter_database_passwords(
+                project,
+                root_auth,
+                database_user,
+                new_root_password=current["db_root_password"],
+            )
+        except Exception as error:
+            errors.append(f"DB root 계정: {error}")
+
+    for name, path in paths.items():
+        try:
+            atomic_secret_write(path, current[name])
+        except Exception as error:
+            errors.append(f"호스트 비밀 파일 {path.name}: {error}")
+
+    recovered = False
+    try:
+        project.run(
+            "up", "--detach", "--force-recreate", "--wait", "--wait-timeout", "300"
+        )
+        verify_rotation(project, database_user, current, replacement)
+        for name, path in paths.items():
+            if read_secret(path, require_owner=True) != current[name]:
+                raise RotationError(f"호스트 비밀 파일 복구 검증 실패: {path.name}")
+        recovered = True
+    except Exception as error:
+        errors.append(f"최종 재기동·검증: {error}")
+    return errors, recovered
