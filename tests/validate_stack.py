@@ -190,6 +190,10 @@ def validate_tools() -> None:
             r"stack_backup\.py restore",
             r"^backup-restore-test:",
             r"runtime_stack\.py backup-restore",
+            r"^rotate-secrets:",
+            r"rotate_secrets\.py",
+            r"^rotation-test:",
+            r"runtime_stack\.py rotation",
         ],
     )
     require_text(
@@ -223,6 +227,39 @@ def validate_tools() -> None:
     if re.search(r"-p(?:\\?['\"])?\$\(cat", backup_tool):
         fail("database client passwords must not be exposed in command arguments")
     require_text(
+        "tools/rotate_secrets.py",
+        [
+            r"def atomic_secret_write",
+            r"def verify_rotation",
+            r"def maybe_fail",
+            r"rollback_errors",
+            r"--new-secrets-dir",
+            r"project_operation_lock",
+            r"tempnam",
+            r"SIGNAL SQLSTATE",
+            r"admin-user-command",
+            r"root-password-command",
+            r"host-file",
+            r"find_root_password",
+            r"verify_runtime_secret_boundary",
+            r"O_NOFOLLOW",
+            r"signal\.SIGINT",
+            r"signal\.SIGTERM",
+            r"one_off",
+            r'"run",\s*\n\s*"--rm"',
+            r'"--entrypoint",\s*\n\s*"php"',
+            r"recreate-wordpress-removed",
+            r'project\.run\("rm", "--stop", "--force", "wordpress"\)',
+            r'"rollback_active"',
+            r'"deferred"',
+            r"--pause-after",
+            r"--rollback-ready-file",
+        ],
+    )
+    rotation_tool = require_file("tools/rotate_secrets.py").read_text()
+    if re.search(r"auth=/tmp/container-stack-(?:root|app)\.\$\$", rotation_tool):
+        fail("rotation database clients must use unpredictable private option files")
+    require_text(
         "tests/runtime_stack.py",
         [
             r"--project-name",
@@ -254,6 +291,18 @@ def validate_tools() -> None:
             r"command\.append\(\"--all\"\)",
             r"TMPDIR",
             r"다른 관리 작업이 실행 중입니다",
+            r"def verify_secret_rotation",
+            r"timeout=600",
+            r"def _assert_rotation_state",
+            r"admin-user-command",
+            r"root-password-command",
+            r"host-file",
+            r"config-command",
+            r"recreate-wordpress-removed",
+            r"def _interrupt_rotation_tool",
+            r"rotation-host-files\.ready",
+            r"rotation-rollback\.ready",
+            r"추가 종료 신호 지연 처리",
         ],
     )
 
