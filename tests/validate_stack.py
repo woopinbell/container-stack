@@ -123,8 +123,33 @@ def validate_dockerfiles() -> None:
     }
     for service, patterns in services.items():
         require_file(f"srcs/requirements/{service}/.dockerignore")
-        require_text(f"srcs/requirements/{service}/Dockerfile", patterns)
+        dockerfile = require_text(f"srcs/requirements/{service}/Dockerfile", patterns)
+        if "bookworm-20241202-slim@sha256:1537a6a1cbc4b4fd401da800ee9480207e7dc1f23560c21259f681db56768f63" not in dockerfile:
+            fail(f"{service} must pin the Debian base image digest")
+        if "snapshot.debian.org/archive/debian/20241214T000000Z" not in dockerfile:
+            fail(f"{service} must use the immutable Debian package snapshot")
         require_executable(f"srcs/requirements/{service}/tools/docker-entrypoint.sh")
+
+    wordpress = require_file("srcs/requirements/wordpress/Dockerfile").read_text()
+    for required in (
+        "WP_CLI_VERSION=2.11.0",
+        "WORDPRESS_VERSION=6.7.1",
+        "a39021ac809530ea607580dbf93afbc46ba02f86b6cffd03de4b126ca53079f6",
+        "33529cd638c845007e8e0d26c91d60c9c16b822c849c8deead03d0c851a26deb",
+        "sha256sum -c -",
+        "/usr/src/wordpress-core.sha256",
+    ):
+        if required not in wordpress:
+            fail(f"wordpress image is missing pinned artifact data: {required}")
+    entrypoint = require_file(
+        "srcs/requirements/wordpress/tools/docker-entrypoint.sh"
+    ).read_text()
+    if (
+        "wp core download" in entrypoint
+        or "/usr/src/wordpress-core.sha256" not in entrypoint
+        or 'cp -p -- "$source" "$temporary"' not in entrypoint
+    ):
+        fail("WordPress must copy the verified image artifact instead of downloading at runtime")
 
 
 def validate_configs() -> None:

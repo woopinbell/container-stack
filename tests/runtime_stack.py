@@ -470,6 +470,10 @@ class RuntimeStack:
             raise StackError("HTTPS 포트 충돌 뒤 새 포트를 선택하지 않았습니다")
         self._verify_legacy_config_migration()
         self.assert_runtime_secret_boundary()
+        if self.wordpress("core", "version", capture=True) != "6.7.1":
+            raise StackError("고정한 WordPress 코어 버전과 실행 버전이 다릅니다")
+        if "WP-CLI 2.11.0" not in self.wordpress("cli", "version", capture=True):
+            raise StackError("고정한 WP-CLI 버전과 실행 버전이 다릅니다")
         if self.fetch("/healthz").strip() != "ok":
             raise StackError("nginx 상태 응답이 예상과 다릅니다")
 
