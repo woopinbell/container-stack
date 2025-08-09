@@ -102,20 +102,20 @@ def validate_compose() -> None:
 def validate_dockerfiles() -> None:
     services = {
         "nginx": [
-            r"FROM\s+debian:bookworm-slim|FROM\s+alpine:",
+            r"FROM\s+debian:bookworm(?:-\d{8})?-slim|FROM\s+alpine:",
             r"apt-get install|apk add",
             r"COPY conf/nginx\.conf",
             r"EXPOSE 443",
         ],
         "mariadb": [
-            r"FROM\s+debian:bookworm-slim|FROM\s+alpine:",
+            r"FROM\s+debian:bookworm(?:-\d{8})?-slim|FROM\s+alpine:",
             r"mariadb-server",
             r"rm -rf /var/lib/mysql",
             r"COPY conf/50-server\.cnf",
             r"ENTRYPOINT",
         ],
         "wordpress": [
-            r"FROM\s+debian:bookworm-slim|FROM\s+alpine:",
+            r"FROM\s+debian:bookworm(?:-\d{8})?-slim|FROM\s+alpine:",
             r"php8\.2-fpm|php-fpm",
             r"wp-cli\.phar",
             r"EXPOSE 9000",
