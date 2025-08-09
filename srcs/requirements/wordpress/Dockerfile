@@ -24,11 +24,28 @@ RUN apt-get -o Acquire::Check-Valid-Until=false update \
         php8.2-zip \
     && rm -rf /var/lib/apt/lists/*
 
-RUN curl -fsSL https://raw.githubusercontent.com/wp-cli/builds/gh-pages/phar/wp-cli.phar \
+ENV WP_CLI_VERSION=2.11.0 \
+    WORDPRESS_VERSION=6.7.1
+
+RUN curl -fsSL \
+        "https://github.com/wp-cli/wp-cli/releases/download/v${WP_CLI_VERSION}/wp-cli-${WP_CLI_VERSION}.phar" \
         -o /usr/local/bin/wp \
-    && chmod +x /usr/local/bin/wp \
-    && mkdir -p /run/php /var/www/html /var/www/config \
-    && chown -R www-data:www-data /run/php /var/www/html /var/www/config
+    && echo 'a39021ac809530ea607580dbf93afbc46ba02f86b6cffd03de4b126ca53079f6  /usr/local/bin/wp' \
+        | sha256sum -c - \
+    && chmod 0755 /usr/local/bin/wp \
+    && curl -fsSL "https://wordpress.org/wordpress-${WORDPRESS_VERSION}.tar.gz" \
+        -o /tmp/wordpress.tar.gz \
+    && echo '33529cd638c845007e8e0d26c91d60c9c16b822c849c8deead03d0c851a26deb  /tmp/wordpress.tar.gz' \
+        | sha256sum -c - \
+    && mkdir -p /usr/src/wordpress /run/php /var/www/html /var/www/config \
+    && tar -xzf /tmp/wordpress.tar.gz --strip-components=1 -C /usr/src/wordpress \
+    && rm /tmp/wordpress.tar.gz \
+    && cd /usr/src/wordpress \
+    && find . -type f ! -path './wp-content/*' -print0 \
+        | sort -z \
+        | xargs -0 sha256sum > /usr/src/wordpress-core.sha256 \
+    && chown -R www-data:www-data \
+        /usr/src/wordpress /run/php /var/www/html /var/www/config
 
 WORKDIR /var/www/html
 

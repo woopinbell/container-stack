@@ -82,15 +82,78 @@ install_core_files() {
         -o -type l -print | grep -q .; then
         fail "WordPress core path contains a symbolic link"
     fi
-    if [ ! -f "${wordpress_dir}/wp-includes/version.php" ]; then
-        wp core download --allow-root --path="$wordpress_dir"
-    fi
+    while IFS= read -r manifest_line; do
+        digest="${manifest_line%% *}"
+        relative="${manifest_line#*  ./}"
+        case "$relative" in
+            ""|/*|../*|*/../*|*/..) fail "invalid WordPress core manifest path" ;;
+        esac
+        source="/usr/src/wordpress/${relative}"
+        target="${wordpress_dir}/${relative}"
+        parent="${target%/*}"
+        install -d -m 0755 -o www-data -g www-data "$parent"
+        if [ -L "$target" ]; then
+            fail "WordPress core target is a symbolic link: $relative"
+        fi
+        if [ -f "$target" ] \
+            && printf '%s  %s\n' "$digest" "$target" | sha256sum -c - >/dev/null 2>&1; then
+            continue
+        fi
+        if [ -e "$target" ] && [ ! -f "$target" ]; then
+            fail "WordPress core target is not a regular file: $relative"
+        fi
+        base="${target##*/}"
+        temporary="${parent}/.${base}.bootstrap.$$"
+        rm -f -- "$temporary"
+        cp -p -- "$source" "$temporary"
+        chown www-data:www-data "$temporary"
+        sync -f "$temporary"
+        mv -f -- "$temporary" "$target"
+        sync -f "$parent"
+    done < /usr/src/wordpress-core.sha256
+    (
+        cd "$wordpress_dir"
+        sha256sum -c /usr/src/wordpress-core.sha256 >/dev/null
+    ) || fail "WordPress core checksum verification failed"
     [ -f "${wordpress_dir}/wp-includes/version.php" ] \
         || fail "WordPress core files are incomplete"
 }
 
 install_content_files() {
-    :
+    source_root=/usr/src/wordpress/wp-content
+    target_root="${wordpress_dir}/wp-content"
+    if [ -L "$target_root" ]; then
+        fail "WordPress content directory must not be a symbolic link"
+    fi
+    install -d -m 0755 -o www-data -g www-data "$target_root"
+    (
+        cd "$source_root"
+        find . -mindepth 1 -type d -print | sort
+    ) | while IFS= read -r relative; do
+        target="${target_root}/${relative#./}"
+        if [ -L "$target" ] || { [ -e "$target" ] && [ ! -d "$target" ]; }; then
+            fail "WordPress content path is not a regular directory: $relative"
+        fi
+        install -d -m 0755 -o www-data -g www-data "$target"
+    done
+    (
+        cd "$source_root"
+        find . -type f -print | sort
+    ) | while IFS= read -r relative; do
+        source="${source_root}/${relative#./}"
+        target="${target_root}/${relative#./}"
+        if [ -e "$target" ] || [ -L "$target" ]; then
+            continue
+        fi
+        parent="${target%/*}"
+        base="${target##*/}"
+        temporary="${parent}/.${base}.bootstrap.$$"
+        cp -p -- "$source" "$temporary"
+        chown www-data:www-data "$temporary"
+        sync -f "$temporary"
+        mv -- "$temporary" "$target"
+        sync -f "$parent"
+    done
 }
 
 publish_config_link() {
@@ -169,6 +232,8 @@ write_wordpress_config() {
             printf "define('WP_HOME', '%s');\n" "$WORDPRESS_URL"
             printf "define('WP_SITEURL', '%s');\n" "$WORDPRESS_URL"
             printf '%s\n' \
+                "define('WP_AUTO_UPDATE_CORE', false);" \
+                "define('AUTOMATIC_UPDATER_DISABLED', true);" \
                 "\$table_prefix = 'wp_';" \
                 "if (!defined('ABSPATH')) { define('ABSPATH', __DIR__ . '/'); }" \
                 "require_once ABSPATH . 'wp-settings.php';"
@@ -378,7 +443,6 @@ bootstrap() {
     : "${WORDPRESS_DB_HOST:=mariadb}"
     : "${MYSQL_DATABASE:?MYSQL_DATABASE is required}"
     : "${MYSQL_USER:?MYSQL_USER is required}"
-    : "${DOMAIN_NAME:?DOMAIN_NAME is required}"
     : "${WORDPRESS_URL:?WORDPRESS_URL is required}"
     : "${WORDPRESS_TITLE:?WORDPRESS_TITLE is required}"
     : "${WORDPRESS_ADMIN_USER:?WORDPRESS_ADMIN_USER is required}"

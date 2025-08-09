@@ -117,7 +117,7 @@ def validate_dockerfiles() -> None:
         "wordpress": [
             r"FROM\s+debian:bookworm(?:-\d{8})?-slim|FROM\s+alpine:",
             r"php8\.2-fpm|php-fpm",
-            r"wp-cli\.phar",
+            r"wp-cli-\$\{WP_CLI_VERSION\}\.phar",
             r"EXPOSE 9000",
         ],
     }
