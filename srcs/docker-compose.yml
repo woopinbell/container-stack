@@ -20,7 +20,7 @@ services:
       wordpress:
         condition: service_healthy
     networks:
-      - inception
+      - frontend
     healthcheck:
       test: ["CMD-SHELL", "curl -kfsS https://127.0.0.1/healthz >/dev/null"]
       interval: 10s
@@ -39,7 +39,7 @@ services:
     volumes:
       - mariadb_data:/var/lib/mysql-volume
     networks:
-      - inception
+      - backend
     healthcheck:
       test: ["CMD-SHELL", "test -f /var/lib/mysql-volume/data/.container-stack-initialized && test -S /run/mysqld/mysqld.sock && kill -0 1"]
       interval: 10s
@@ -70,7 +70,8 @@ services:
       mariadb:
         condition: service_healthy
     networks:
-      - inception
+      - frontend
+      - backend
     healthcheck:
       test: ["CMD-SHELL", "test -f /var/www/html/.container-stack-initialized && REQUEST_METHOD=GET SCRIPT_NAME=/ping SCRIPT_FILENAME=/ping cgi-fcgi -bind -connect 127.0.0.1:9000 | grep -q pong"]
       interval: 10s
@@ -79,8 +80,11 @@ services:
       start_period: 40s
 
 networks:
-  inception:
+  frontend:
     driver: bridge
+  backend:
+    driver: bridge
+    internal: true
 
 volumes:
   mariadb_data:
