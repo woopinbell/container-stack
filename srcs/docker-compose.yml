@@ -10,6 +10,22 @@ services:
       context: ./requirements/nginx
     image: ${STACK_IMAGE_PREFIX:-container-stack}-nginx:${STACK_IMAGE_TAG:-local}
     restart: unless-stopped
+    cpus: ${NGINX_CPUS:-0.50}
+    mem_limit: ${NGINX_MEMORY:-128m}
+    pids_limit: ${NGINX_PIDS_LIMIT:-64}
+    ulimits:
+      nofile:
+        soft: ${NGINX_NOFILE_SOFT:-1024}
+        hard: ${NGINX_NOFILE_HARD:-4096}
+    stop_signal: SIGQUIT
+    stop_grace_period: 15s
+    security_opt:
+      - no-new-privileges:true
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     environment:
       DOMAIN_NAME: ${DOMAIN_NAME:?set DOMAIN_NAME}
     ports:
@@ -33,6 +49,22 @@ services:
       context: ./requirements/mariadb
     image: ${STACK_IMAGE_PREFIX:-container-stack}-mariadb:${STACK_IMAGE_TAG:-local}
     restart: unless-stopped
+    cpus: ${MARIADB_CPUS:-1.00}
+    mem_limit: ${MARIADB_MEMORY:-512m}
+    pids_limit: ${MARIADB_PIDS_LIMIT:-256}
+    ulimits:
+      nofile:
+        soft: ${MARIADB_NOFILE_SOFT:-4096}
+        hard: ${MARIADB_NOFILE_HARD:-65536}
+    stop_signal: SIGTERM
+    stop_grace_period: 60s
+    security_opt:
+      - no-new-privileges:true
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     environment:
       MYSQL_DATABASE: ${MYSQL_DATABASE:?set MYSQL_DATABASE}
       MYSQL_USER: ${MYSQL_USER:?set MYSQL_USER}
@@ -52,6 +84,22 @@ services:
       context: ./requirements/wordpress
     image: ${STACK_IMAGE_PREFIX:-container-stack}-wordpress:${STACK_IMAGE_TAG:-local}
     restart: unless-stopped
+    cpus: ${WORDPRESS_CPUS:-1.00}
+    mem_limit: ${WORDPRESS_MEMORY:-512m}
+    pids_limit: ${WORDPRESS_PIDS_LIMIT:-256}
+    ulimits:
+      nofile:
+        soft: ${WORDPRESS_NOFILE_SOFT:-1024}
+        hard: ${WORDPRESS_NOFILE_HARD:-4096}
+    stop_signal: SIGQUIT
+    stop_grace_period: 30s
+    security_opt:
+      - no-new-privileges:true
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     environment:
       DOMAIN_NAME: ${DOMAIN_NAME:?set DOMAIN_NAME}
       WORDPRESS_URL: ${WORDPRESS_URL:?set WORDPRESS_URL}
