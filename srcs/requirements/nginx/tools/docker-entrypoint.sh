@@ -4,8 +4,8 @@ set -eu
 : "${DOMAIN_NAME:=localhost}"
 
 cert_dir=/etc/nginx/ssl
-cert_file="${cert_dir}/inception.crt"
-key_file="${cert_dir}/inception.key"
+cert_file="${cert_dir}/container-stack.crt"
+key_file="${cert_dir}/container-stack.key"
 
 mkdir -p "$cert_dir" /run/nginx
 
