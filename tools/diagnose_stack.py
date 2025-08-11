@@ -86,3 +86,96 @@ def redact(text: str, secrets: set[str]) -> str:
     for value in sorted(secrets, key=len, reverse=True):
         redacted = redacted.replace(value, "<redacted>")
     return SENSITIVE_ASSIGNMENT.sub(r"\1\2<redacted>", redacted)
+
+
+def run(command: list[str]) -> str:
+    try:
+        result = subprocess.run(
+            command,
+            cwd=ROOT,
+            text=True,
+            capture_output=True,
+            timeout=30,
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        return f"command failed before completion: {error}\n"
+    return (
+        f"exit_code={result.returncode}\n"
+        f"stdout:\n{result.stdout}\n"
+        f"stderr:\n{result.stderr}"
+    )
+
+
+def compose_command(project: str, env_file: Path, *arguments: str) -> list[str]:
+    return [
+        "docker",
+        "compose",
+        "--project-name",
+        project,
+        "--env-file",
+        str(env_file),
+        "--file",
+        str(COMPOSE_FILE),
+        *arguments,
+    ]
+
+
+def container_state(project: str) -> str:
+    ids = subprocess.run(
+        [
+            "docker",
+            "ps",
+            "--all",
+            "--filter",
+            f"label=com.docker.compose.project={project}",
+            "--format",
+            "{{.ID}}",
+        ],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        timeout=30,
+    )
+    container_ids = [line for line in ids.stdout.splitlines() if line]
+    if not container_ids:
+        return f"container_list_exit_code={ids.returncode}\n[]\n"
+    result = subprocess.run(
+        ["docker", "inspect", *container_ids],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        timeout=30,
+    )
+    if result.returncode != 0:
+        return f"exit_code={result.returncode}\nstderr:\n{result.stderr}"
+    inspected = json.loads(result.stdout)
+    selected = []
+    for container in inspected:
+        state = container.get("State", {})
+        host = container.get("HostConfig", {})
+        config = container.get("Config", {})
+        health = state.get("Health") or {}
+        selected.append(
+            {
+                "name": container.get("Name", "").lstrip("/"),
+                "image": config.get("Image"),
+                "status": state.get("Status"),
+                "exit_code": state.get("ExitCode"),
+                "oom_killed": state.get("OOMKilled"),
+                "restarting": state.get("Restarting"),
+                "restart_count": container.get("RestartCount"),
+                "health": health.get("Status", "none"),
+                "memory": host.get("Memory"),
+                "nano_cpus": host.get("NanoCpus"),
+                "pids_limit": host.get("PidsLimit"),
+                "ulimits": host.get("Ulimits"),
+                "log_config": host.get("LogConfig"),
+                "security_opt": host.get("SecurityOpt"),
+                "stop_signal": config.get("StopSignal"),
+                "stop_timeout": config.get("StopTimeout"),
+                "networks": sorted(
+                    (container.get("NetworkSettings", {}).get("Networks") or {}).keys()
+                ),
+            }
+        )
+    return json.dumps(selected, ensure_ascii=False, indent=2) + "\n"
