@@ -1356,23 +1356,246 @@ if ($text === false || !preg_match($pattern, $text, $matches) || !hash_equals($p
                     raise StackError("Compose 로그에 자격증명 값이 포함되었습니다")
         print("secret rotation, ambiguous failures, rollback, and retry passed")
 
-    def collect_diagnostics(self) -> Path:
-        destination = self.diagnostics_dir
-        if destination is None:
-            destination = Path(tempfile.mkdtemp(prefix="container-stack-diagnostics-"))
-            destination.chmod(0o700)
-        else:
-            destination.mkdir(parents=True, exist_ok=True)
-        commands = {
-            "compose-ps.txt": ("ps", "--all"),
-            "compose-logs.txt": ("logs", "--no-color", "--timestamps"),
-            "compose-config.txt": ("config", "--no-interpolate"),
+    def verify_operations(self) -> None:
+        self.start()
+        expected = {
+            "nginx": {
+                "memory": 128 * 1024 * 1024,
+                "nano_cpus": 500_000_000,
+                "pids": 64,
+                "signal": "SIGQUIT",
+                "timeout": 15,
+                "networks": {f"{self.project}_frontend"},
+            },
+            "wordpress": {
+                "memory": 512 * 1024 * 1024,
+                "nano_cpus": 1_000_000_000,
+                "pids": 256,
+                "signal": "SIGQUIT",
+                "timeout": 30,
+                "networks": {
+                    f"{self.project}_frontend",
+                    f"{self.project}_backend",
+                },
+            },
+            "mariadb": {
+                "memory": 512 * 1024 * 1024,
+                "nano_cpus": 1_000_000_000,
+                "pids": 256,
+                "signal": "SIGTERM",
+                "timeout": 60,
+                "networks": {f"{self.project}_backend"},
+            },
         }
-        for filename, arguments in commands.items():
-            result = self.run_compose(*arguments, capture=True, check=False)
-            (destination / filename).write_text(
-                result.stdout + result.stderr, encoding="utf-8"
+        container_ids: dict[str, str] = {}
+        for service, policy in expected.items():
+            inspected = self.inspect_service(service)
+            container_ids[service] = str(inspected["Id"])
+            host = inspected["HostConfig"]
+            config = inspected["Config"]
+            actual = {
+                "memory": host["Memory"],
+                "nano_cpus": host["NanoCpus"],
+                "pids": host["PidsLimit"],
+                "signal": config["StopSignal"],
+                "timeout": config["StopTimeout"],
+                "networks": set(inspected["NetworkSettings"]["Networks"]),
+            }
+            if actual != policy:
+                raise StackError(
+                    f"{service} 실행 정책이 Compose 설정과 다릅니다: {actual!r}"
+                )
+            log_config = host["LogConfig"]
+            if log_config["Type"] != "json-file" or log_config["Config"] != {
+                "max-file": "3",
+                "max-size": "10m",
+            }:
+                raise StackError(f"{service} 로그 회전 정책이 적용되지 않았습니다")
+            if "no-new-privileges:true" not in (host["SecurityOpt"] or []):
+                raise StackError(f"{service} 권한 상승 차단 정책이 적용되지 않았습니다")
+            expected_nofile = {
+                "nginx": (1024, 4096),
+                "wordpress": (1024, 4096),
+                "mariadb": (4096, 65536),
+            }[service]
+            nofile = next(
+                (item for item in host["Ulimits"] if item["Name"] == "nofile"), None
             )
+            if nofile is None or (
+                nofile["Soft"], nofile["Hard"]
+            ) != expected_nofile:
+                raise StackError(f"{service} 파일 디스크립터 제한이 적용되지 않았습니다")
+
+        network_policies = {
+            "frontend": (False, {container_ids["nginx"], container_ids["wordpress"]}),
+            "backend": (True, {container_ids["wordpress"], container_ids["mariadb"]}),
+        }
+        for name, (expected_internal, expected_members) in network_policies.items():
+            network = subprocess.run(
+                ["docker", "network", "inspect", f"{self.project}_{name}"],
+                check=True,
+                text=True,
+                capture_output=True,
+                timeout=PROCESS_TIMEOUT_SECONDS,
+            )
+            inspected_network = json.loads(network.stdout)[0]
+            actual_members = set((inspected_network.get("Containers") or {}).keys())
+            if inspected_network.get("Internal") is not expected_internal:
+                raise StackError(f"{name} 네트워크의 내부망 정책이 예상과 다릅니다")
+            if actual_members != expected_members:
+                raise StackError(f"{name} 네트워크의 연결 서비스가 예상과 다릅니다")
+
+        refused = subprocess.run(
+            [
+                "make",
+                "--silent",
+                "fclean",
+                f"PROJECT_NAME={self.project}",
+                f"ENV_FILE={self.env_file}",
+            ],
+            cwd=ROOT,
+            text=True,
+            capture_output=True,
+            timeout=PROCESS_TIMEOUT_SECONDS,
+        )
+        if refused.returncode != 2 or "DESTROY_CONFIRM" not in refused.stderr:
+            raise StackError("fclean이 명시적인 프로젝트 이름 확인 없이 실행될 수 있습니다")
+        if self.fetch("/healthz").strip() != "ok":
+            raise StackError("삭제 거부 뒤 실행 중인 스택이 손상되었습니다")
+
+        log_secret = self.credential_values["wp_user_password.txt"]
+        self.fetch(f"/?diagnostic_token={log_secret}")
+        unreadable_secret = self.temp / "wp_user_password.txt"
+        unreadable_output = self.temp / "unreadable-secret-diagnostics"
+        unreadable_command = [
+            sys.executable,
+            str(ROOT / "tools" / "diagnose_stack.py"),
+            "--project",
+            self.project,
+            "--env-file",
+            str(self.env_file),
+            "--output",
+            str(unreadable_output),
+        ]
+        unreadable_secret.chmod(0)
+        try:
+            refused_unredacted = subprocess.run(
+                unreadable_command,
+                cwd=ROOT,
+                text=True,
+                capture_output=True,
+                timeout=PROCESS_TIMEOUT_SECONDS,
+            )
+        finally:
+            unreadable_secret.chmod(0o600)
+        if (
+            refused_unredacted.returncode != 2
+            or "가릴 비밀값을 읽을 수 없습니다" not in refused_unredacted.stderr
+            or unreadable_output.exists()
+        ):
+            raise StackError("진단 도구가 읽지 못한 비밀값을 제외한 채 계속 실행했습니다")
+
+        diagnostics = self.temp / "operations-diagnostics"
+        diagnostic_command = [
+            sys.executable,
+            str(ROOT / "tools" / "diagnose_stack.py"),
+            "--project",
+            self.project,
+            "--env-file",
+            str(self.env_file),
+            "--output",
+            str(diagnostics),
+        ]
+        subprocess.run(
+            diagnostic_command,
+            cwd=ROOT,
+            check=True,
+            timeout=PROCESS_TIMEOUT_SECONDS,
+        )
+        expected_files = {
+            "versions.txt",
+            "compose-ps.txt",
+            "compose-logs.txt",
+            "compose-model.txt",
+            "container-state.txt",
+        }
+        if {path.name for path in diagnostics.iterdir()} != expected_files:
+            raise StackError("진단 자료 파일 구성이 예상과 다릅니다")
+        if stat.S_IMODE(diagnostics.stat().st_mode) != 0o700:
+            raise StackError("진단 디렉터리 권한이 0700이 아닙니다")
+        combined = ""
+        for path in diagnostics.iterdir():
+            if not path.is_file() or path.is_symlink():
+                raise StackError(f"진단 결과에 일반 파일이 아닌 항목이 있습니다: {path}")
+            if stat.S_IMODE(path.stat().st_mode) != 0o600:
+                raise StackError(f"진단 파일 권한이 0600이 아닙니다: {path}")
+            combined += path.read_text(encoding="utf-8")
+        leaked = [
+            value for value in self.credential_values.values() if value in combined
+        ]
+        if leaked:
+            raise StackError("진단 자료에 비밀값이 남아 있습니다")
+        if "<redacted>" not in combined:
+            raise StackError("진단 자료의 실제 비밀값 제거를 확인하지 못했습니다")
+        for filename in self.credential_values:
+            if str(self.temp / filename) in combined:
+                raise StackError("진단 자료에 비밀 파일 경로가 남아 있습니다")
+        original = {
+            path.name: path.read_bytes() for path in diagnostics.iterdir()
+        }
+        repeated = subprocess.run(
+            diagnostic_command,
+            cwd=ROOT,
+            text=True,
+            capture_output=True,
+            timeout=PROCESS_TIMEOUT_SECONDS,
+        )
+        if repeated.returncode != 2 or "이미 존재합니다" not in repeated.stderr:
+            raise StackError("진단 도구가 기존 출력 경로 덮어쓰기를 거부하지 않았습니다")
+        if original != {
+            path.name: path.read_bytes() for path in diagnostics.iterdir()
+        }:
+            raise StackError("진단 도구의 덮어쓰기 거부 뒤 기존 결과가 변경되었습니다")
+
+        dangling_target = self.temp / "missing-diagnostics-target"
+        symlink_output = self.temp / "operations-diagnostics-link"
+        symlink_output.symlink_to(dangling_target)
+        symlink_command = [*diagnostic_command[:-1], str(symlink_output)]
+        refused_symlink = subprocess.run(
+            symlink_command,
+            cwd=ROOT,
+            text=True,
+            capture_output=True,
+            timeout=PROCESS_TIMEOUT_SECONDS,
+        )
+        if refused_symlink.returncode != 2 or "이미 존재합니다" not in refused_symlink.stderr:
+            raise StackError("진단 도구가 dangling symlink 출력 경로를 거부하지 않았습니다")
+        if not symlink_output.is_symlink() or dangling_target.exists():
+            raise StackError("진단 도구의 symlink 거부 과정에서 출력 경로가 변경되었습니다")
+        print("runtime limits, network isolation, and private diagnostics passed")
+
+    def collect_diagnostics(self) -> Path:
+        if self.diagnostics_dir is None:
+            destination = Path(tempfile.gettempdir()) / (
+                f"container-stack-diagnostics-{self.project}-{secrets.token_hex(3)}"
+            )
+        else:
+            destination = self.diagnostics_dir / self.project
+        subprocess.run(
+            [
+                sys.executable,
+                str(ROOT / "tools" / "diagnose_stack.py"),
+                "--project",
+                self.project,
+                "--env-file",
+                str(self.env_file),
+                "--output",
+                str(destination),
+            ],
+            cwd=ROOT,
+            check=True,
+            timeout=PROCESS_TIMEOUT_SECONDS,
+        )
         print(f"진단 자료: {destination}", file=sys.stderr)
         return destination
 
@@ -1380,7 +1603,7 @@ if ($text === false || !preg_match($pattern, $text, $matches) || !hash_equals($p
         if failed:
             try:
                 self.collect_diagnostics()
-            except OSError as error:
+            except (OSError, subprocess.CalledProcessError) as error:
                 print(f"진단 자료를 저장하지 못했습니다: {error}", file=sys.stderr)
         if self.started and not self.keep:
             self.run_compose(
@@ -1399,7 +1622,14 @@ def parse_arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="격리된 컨테이너 스택 검증")
     parser.add_argument(
         "scenario",
-        choices=("bootstrap", "e2e", "persistence", "backup-restore", "rotation"),
+        choices=(
+            "bootstrap",
+            "e2e",
+            "persistence",
+            "backup-restore",
+            "rotation",
+            "operations",
+        ),
     )
     parser.add_argument("--keep", action="store_true", help="검사 뒤 프로젝트를 유지합니다")
     parser.add_argument("--diagnostics-dir", type=Path)
@@ -1411,6 +1641,7 @@ def main() -> int:
     try:
         require_command("docker")
         require_command("curl")
+        require_command("make")
         subprocess.run(
             ["docker", "compose", "version"],
             check=True,
@@ -1432,8 +1663,10 @@ def main() -> int:
             stack.verify_e2e()
         elif args.scenario == "backup-restore":
             stack.verify_backup_restore()
-        else:
+        elif args.scenario == "rotation":
             stack.verify_secret_rotation()
+        else:
+            stack.verify_operations()
         failed = False
         return 0
     except (OSError, StackError, subprocess.SubprocessError) as error:

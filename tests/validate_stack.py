@@ -97,6 +97,25 @@ def validate_compose() -> None:
     for image in ("wordpress:", "mariadb:", "nginx:"):
         if re.search(rf"image:\s*{image}", text):
             fail(f"compose must not use the official {image.rstrip(':')} image directly")
+    if "container_name:" in text:
+        fail("compose services must use project-scoped generated container names")
+    for pattern in (r"WORDPRESS_URL:", r"STACK_IMAGE_PREFIX", r"STACK_IMAGE_TAG"):
+        if not re.search(pattern, text):
+            fail(f"compose does not match {pattern!r}")
+    for required in (
+        "cpus:",
+        "mem_limit:",
+        "pids_limit:",
+        "no-new-privileges:true",
+        "driver: json-file",
+        'max-size: "10m"',
+        'max-file: "3"',
+        "stop_grace_period:",
+    ):
+        if text.count(required) != 3:
+            fail(f"all three services must set the runtime policy: {required}")
+    if not re.search(r"backend:\s+driver: bridge\s+internal: true", text):
+        fail("database network must be an internal bridge")
 
 
 def validate_dockerfiles() -> None:
@@ -160,6 +179,8 @@ def validate_configs() -> None:
             r"fastcgi_pass wordpress:9000",
             r"ssl_certificate",
             r"location = /healthz",
+            r"access_log /dev/stdout",
+            r"error_log /dev/stderr warn",
         ],
     )
     if "http2 on;" in require_file("srcs/requirements/nginx/conf/nginx.conf").read_text():
@@ -219,6 +240,13 @@ def validate_tools() -> None:
             r"rotate_secrets\.py",
             r"^rotation-test:",
             r"runtime_stack\.py rotation",
+            r"^config-strict:",
+            r"config --quiet",
+            r"^diagnostics:",
+            r"diagnose_stack\.py",
+            r"^operations-test:",
+            r"runtime_stack\.py operations",
+            r"DESTROY_CONFIRM",
         ],
     )
     require_text(
@@ -285,6 +313,21 @@ def validate_tools() -> None:
     if re.search(r"auth=/tmp/container-stack-(?:root|app)\.\$\$", rotation_tool):
         fail("rotation database clients must use unpredictable private option files")
     require_text(
+        "tools/diagnose_stack.py",
+        [
+            r"secret_values",
+            r"def redact",
+            r"0o600",
+            r"0o700",
+            r"--no-interpolate",
+            r"--tail",
+            r"container_state",
+            r"read_private_secret",
+            r"가릴 비밀값을 읽을 수 없습니다",
+        ],
+    )
+    require_executable("tools/diagnose_stack.py")
+    require_text(
         "tests/runtime_stack.py",
         [
             r"--project-name",
@@ -328,6 +371,11 @@ def validate_tools() -> None:
             r"rotation-host-files\.ready",
             r"rotation-rollback\.ready",
             r"추가 종료 신호 지연 처리",
+            r"def verify_operations",
+            r"no-new-privileges:true",
+            r"operations-diagnostics",
+            r"unreadable-secret-diagnostics",
+            r"missing-diagnostics-target",
         ],
     )
 
