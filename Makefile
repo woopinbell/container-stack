@@ -9,7 +9,7 @@ DESTROY_CONFIRM ?=
 
 COMPOSE_RUN := $(COMPOSE) --project-name $(PROJECT_NAME) --env-file $(ENV_FILE) -f $(COMPOSE_FILE)
 
-.PHONY: up start-database start-application down build logs ps clean fclean test config smoke bootstrap-test e2e persistence backup restore backup-restore-test rotate-secrets rotation-test
+.PHONY: up start-database start-application down build logs ps clean fclean test config smoke bootstrap-test e2e persistence backup restore backup-restore-test rotate-secrets rotation-test config-strict
 
 up:
 	python3 tools/start_stack.py start --project "$(PROJECT_NAME)" --env-file "$(ENV_FILE)" --wait-timeout "$(WAIT_TIMEOUT)"
@@ -43,6 +43,11 @@ fclean:
 
 config:
 	$(COMPOSE_RUN) config
+
+config-strict:
+	@command -v docker >/dev/null 2>&1 || { echo "docker 명령을 찾을 수 없습니다." >&2; exit 2; }
+	@docker compose version >/dev/null 2>&1 || { echo "Docker Compose v2를 사용할 수 없습니다." >&2; exit 2; }
+	$(COMPOSE_RUN) config --quiet
 
 test:
 	python3 tests/validate_stack.py
