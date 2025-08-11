@@ -6,10 +6,11 @@ WAIT_TIMEOUT ?= 300
 BACKUP_DIR ?=
 NEW_SECRETS_DIR ?=
 DESTROY_CONFIRM ?=
+DIAGNOSTICS_DIR ?= diagnostics/$(PROJECT_NAME)
 
 COMPOSE_RUN := $(COMPOSE) --project-name $(PROJECT_NAME) --env-file $(ENV_FILE) -f $(COMPOSE_FILE)
 
-.PHONY: up start-database start-application down build logs ps clean fclean test config smoke bootstrap-test e2e persistence backup restore backup-restore-test rotate-secrets rotation-test config-strict
+.PHONY: up start-database start-application down build logs ps clean fclean test config smoke bootstrap-test e2e persistence backup restore backup-restore-test rotate-secrets rotation-test config-strict diagnostics
 
 up:
 	python3 tools/start_stack.py start --project "$(PROJECT_NAME)" --env-file "$(ENV_FILE)" --wait-timeout "$(WAIT_TIMEOUT)"
@@ -87,3 +88,6 @@ rotate-secrets:
 
 rotation-test:
 	python3 tests/runtime_stack.py rotation
+
+diagnostics:
+	python3 tools/diagnose_stack.py --project "$(PROJECT_NAME)" --env-file "$(ENV_FILE)" --output "$(DIAGNOSTICS_DIR)"

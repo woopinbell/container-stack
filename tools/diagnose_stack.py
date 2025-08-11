@@ -179,3 +179,81 @@ def container_state(project: str) -> str:
             }
         )
     return json.dumps(selected, ensure_ascii=False, indent=2) + "\n"
+
+
+def write_private(path: Path, text: str) -> None:
+    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+        stream.write(text)
+
+
+def collect(project: str, env_file: Path, destination: Path) -> None:
+    if not PROJECT_PATTERN.fullmatch(project):
+        raise DiagnosticError("프로젝트 이름은 소문자·숫자로 시작하고 63자를 넘을 수 없습니다")
+    if not env_file.is_file():
+        raise DiagnosticError(f"환경 파일을 찾을 수 없습니다: {env_file}")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        destination.mkdir(mode=0o700)
+    except FileExistsError as error:
+        raise DiagnosticError(f"출력 경로가 이미 존재합니다: {destination}") from error
+    try:
+        config = rendered_compose_config(project, env_file)
+        secrets = secret_values(config)
+        outputs = {
+            "versions.txt": run(["docker", "version"])
+            + "\n"
+            + run(["docker", "compose", "version"]),
+            "compose-ps.txt": run(
+                compose_command(project, env_file, "ps", "--all", "--format", "json")
+            ),
+            "compose-logs.txt": run(
+                compose_command(
+                    project,
+                    env_file,
+                    "logs",
+                    "--no-color",
+                    "--timestamps",
+                    "--tail",
+                    "200",
+                )
+            ),
+            "compose-model.txt": run(
+                compose_command(project, env_file, "config", "--no-interpolate")
+            ),
+            "container-state.txt": container_state(project),
+        }
+        for filename, output in outputs.items():
+            redacted = redact(output, secrets)
+            if any(value in redacted for value in secrets):
+                raise DiagnosticError(f"진단 파일의 비밀값 제거에 실패했습니다: {filename}")
+            write_private(destination / filename, redacted)
+    except Exception:
+        shutil.rmtree(destination, ignore_errors=True)
+        raise
+
+
+def parse_arguments() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="컨테이너 스택 장애 진단 자료 수집")
+    parser.add_argument("--project", required=True)
+    parser.add_argument("--env-file", type=Path, required=True)
+    parser.add_argument("--output", type=Path, required=True)
+    return parser.parse_args()
+
+
+def main() -> int:
+    args = parse_arguments()
+    output = args.output.expanduser()
+    if not output.is_absolute():
+        output = Path.cwd() / output
+    try:
+        collect(args.project, args.env_file.resolve(), output)
+    except (DiagnosticError, OSError, subprocess.SubprocessError) as error:
+        print(f"진단 자료 수집 실패: {error}", file=sys.stderr)
+        return 2
+    print(f"진단 자료를 저장했습니다: {output}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

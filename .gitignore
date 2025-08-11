@@ -5,3 +5,4 @@ secrets/*.txt
 .DS_Store
 __pycache__/
 *.py[cod]
+diagnostics/
