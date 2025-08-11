@@ -5,6 +5,7 @@ PROJECT_NAME ?= container-stack
 WAIT_TIMEOUT ?= 300
 BACKUP_DIR ?=
 NEW_SECRETS_DIR ?=
+DESTROY_CONFIRM ?=
 
 COMPOSE_RUN := $(COMPOSE) --project-name $(PROJECT_NAME) --env-file $(ENV_FILE) -f $(COMPOSE_FILE)
 
@@ -34,6 +35,10 @@ ps:
 clean: down
 
 fclean:
+	@test -n "$(PROJECT_NAME)" && test "$(DESTROY_CONFIRM)" = "$(PROJECT_NAME)" || { \
+		echo "볼륨과 로컬 이미지를 삭제하려면 DESTROY_CONFIRM=$(PROJECT_NAME)을 지정하십시오." >&2; \
+		exit 2; \
+	}
 	$(COMPOSE_RUN) down -v --rmi local --remove-orphans
 
 config:
