@@ -9,7 +9,7 @@ if ! command -v curl >/dev/null 2>&1; then
 fi
 
 for _ in $(seq 1 "${SMOKE_RETRIES:-30}"); do
-    if curl -kfsS "$url" >/dev/null; then
+    if curl -kfsS --connect-timeout 5 --max-time 15 "$url" >/dev/null; then
         echo "https smoke passed: $url"
         exit 0
     fi
