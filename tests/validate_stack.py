@@ -214,6 +214,7 @@ def validate_env_policy() -> None:
 
 def validate_tools() -> None:
     require_executable("tools/smoke_https.sh")
+    require_text("tools/smoke_https.sh", [r"curl .+--connect-timeout", r"curl .+--max-time"])
     require_executable("tools/start_stack.py")
     require_file("tools/stack_runtime.py")
     require_text(
