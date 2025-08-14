@@ -6,3 +6,4 @@ secrets/*.txt
 __pycache__/
 *.py[cod]
 diagnostics/
+artifacts/

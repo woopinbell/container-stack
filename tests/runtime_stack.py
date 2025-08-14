@@ -15,7 +15,6 @@ import stat
 import subprocess
 import sys
 import tempfile
-from typing import Any
 import time
 
 
@@ -80,10 +79,14 @@ class RuntimeStack:
         *,
         keep: bool,
         diagnostics_dir: Path | None,
+        project_record_dir: Path | None = None,
         credential_values: dict[str, str] | None = None,
+        image_prefix: str | None = None,
+        owns_images: bool = True,
     ) -> None:
         self.keep = keep
         self.diagnostics_dir = diagnostics_dir
+        self.project_record_dir = project_record_dir
         self.temp = Path(tempfile.mkdtemp(prefix="container-stack-e2e-"))
         self.temp.chmod(0o700)
         self.project = f"container-stack-{os.getpid()}-{secrets.token_hex(3)}"
@@ -91,6 +94,8 @@ class RuntimeStack:
         self.port = reserve_port()
         self.env_file = self.temp / ".env"
         self.started = False
+        self.image_prefix = image_prefix or f"{self.project}-image"
+        self.owns_images = owns_images
         self.credential_values = credential_values or {
             "db_root_password.txt": f"root#-{secrets.token_urlsafe(24)}",
             "db_password.txt": f"db#-{secrets.token_urlsafe(24)}",
@@ -98,10 +103,22 @@ class RuntimeStack:
             "wp_user_password.txt": f"user-{secrets.token_urlsafe(24)}",
         }
         try:
+            self._record_project()
             self._prepare_environment()
         except Exception:
             shutil.rmtree(self.temp, ignore_errors=True)
             raise
+
+    def _record_project(self) -> None:
+        if self.project_record_dir is None:
+            return
+        directory = self.project_record_dir
+        if directory.is_symlink():
+            raise StackError(f"프로젝트 기록 경로가 심볼릭 링크입니다: {directory}")
+        directory.mkdir(parents=True, mode=0o700, exist_ok=True)
+        if not directory.is_dir() or stat.S_IMODE(directory.stat().st_mode) & 0o077:
+            raise StackError(f"프로젝트 기록 경로 권한이 안전하지 않습니다: {directory}")
+        write_private(directory / self.project, self.project)
 
     def _prepare_environment(self) -> None:
         for filename, value in self.credential_values.items():
@@ -112,7 +129,7 @@ class RuntimeStack:
             "WORDPRESS_URL": f"https://{self.domain}:{self.port}",
             "HTTPS_BIND_ADDRESS": "127.0.0.1",
             "HTTPS_PORT": str(self.port),
-            "STACK_IMAGE_PREFIX": f"{self.project}-image",
+            "STACK_IMAGE_PREFIX": self.image_prefix,
             "STACK_IMAGE_TAG": "local",
             "MYSQL_DATABASE": "wordpress",
             "MYSQL_USER": "wpuser",
@@ -310,24 +327,6 @@ class RuntimeStack:
                 f"관리 작업 뒤 서비스가 모두 복구되지 않았습니다: {sorted(running)}"
             )
 
-    def inspect_service(self, service: str) -> dict[str, object]:
-        container_id = self.run_compose(
-            "ps", "--quiet", service, capture=True
-        ).stdout.strip()
-        if not container_id or "\n" in container_id:
-            raise StackError(f"{service} 컨테이너를 하나로 식별하지 못했습니다")
-        result = subprocess.run(
-            ["docker", "inspect", container_id],
-            check=True,
-            text=True,
-            capture_output=True,
-            timeout=PROCESS_TIMEOUT_SECONDS,
-        )
-        inspected = json.loads(result.stdout)
-        if not isinstance(inspected, list) or len(inspected) != 1:
-            raise StackError(f"{service} 컨테이너 검사 결과가 예상과 다릅니다")
-        return inspected[0]
-
     def assert_runtime_secret_boundary(
         self, expected_values: dict[str, str] | None = None
     ) -> None:
@@ -441,6 +440,24 @@ class RuntimeStack:
             if value and value in log_output:
                 raise StackError("Compose 로그에 비밀값이 남았습니다")
 
+    def inspect_service(self, service: str) -> dict[str, object]:
+        container_id = self.run_compose(
+            "ps", "--quiet", service, capture=True
+        ).stdout.strip()
+        if not container_id or "\n" in container_id:
+            raise StackError(f"{service} 컨테이너를 하나로 식별하지 못했습니다")
+        result = subprocess.run(
+            ["docker", "inspect", container_id],
+            check=True,
+            text=True,
+            capture_output=True,
+            timeout=PROCESS_TIMEOUT_SECONDS,
+        )
+        inspected = json.loads(result.stdout)
+        if not isinstance(inspected, list) or len(inspected) != 1:
+            raise StackError(f"{service} 컨테이너 검사 결과가 예상과 다릅니다")
+        return inspected[0]
+
     def fetch(self, path: str) -> str:
         url = f"https://{self.domain}:{self.port}{path}"
         result = subprocess.run(
@@ -462,7 +479,6 @@ class RuntimeStack:
             timeout=PROCESS_TIMEOUT_SECONDS,
         )
         return result.stdout
-
 
     def verify_e2e(self) -> None:
         blocked_port = self.port
@@ -1068,7 +1084,7 @@ class RuntimeStack:
                 labelled_name,
                 "--label",
                 f"com.docker.compose.project={restored.project}",
-                f"{self.project}-image-mariadb:local",
+                f"{self.image_prefix}-mariadb:local",
             ],
             check=True,
             text=True,
@@ -1114,7 +1130,7 @@ class RuntimeStack:
                     "create",
                     "--name",
                     name,
-                    f"{self.project}-image-wordpress:local",
+                    f"{self.image_prefix}-wordpress:local",
                 ]
             else:
                 command = ["docker", kind, "create", name]
@@ -1273,6 +1289,7 @@ class RuntimeStack:
         restored = RuntimeStack(
             keep=False,
             diagnostics_dir=self.diagnostics_dir,
+            project_record_dir=self.project_record_dir,
             credential_values=dict(self.credential_values),
         )
         restored.started = True
@@ -1550,7 +1567,6 @@ if ($text === false || !preg_match($pattern, $text, $matches) || !hash_equals($p
             check=False,
         )
         return result.returncode == 0
-
 
     def _assert_no_rotation_temporary_files(self) -> None:
         if list(self.temp.glob(".*.txt.*")):
@@ -1981,27 +1997,68 @@ if ($text === false || !preg_match($pattern, $text, $matches) || !hash_equals($p
         print(f"진단 자료: {destination}", file=sys.stderr)
         return destination
 
+    def _remove_test_images(self) -> None:
+        failures: list[str] = []
+        for service in ("nginx", "wordpress", "mariadb"):
+            image = f"{self.image_prefix}-{service}:local"
+            result = subprocess.run(
+                ["docker", "image", "rm", image],
+                text=True,
+                capture_output=True,
+                timeout=PROCESS_TIMEOUT_SECONDS,
+            )
+            if result.returncode != 0 and "No such image" not in result.stderr:
+                failures.append(
+                    f"{image}: {result.stderr.strip() or result.stdout.strip()}"
+                )
+        if failures:
+            raise StackError(
+                "검사용 이미지 태그를 정리하지 못했습니다: " + "; ".join(failures)
+            )
+
     def close(self, *, failed: bool) -> list[str]:
         failures: list[str] = []
         if failed:
             try:
                 self.collect_diagnostics()
-            except Exception as error:
-                failures.append(f"진단 자료: {error}")
-        if self.started and not self.keep:
-            try:
+            except (OSError, StackError, subprocess.SubprocessError) as error:
+                failures.append(f"진단 자료 저장: {error}")
+        if self.keep:
+            print(
+                f"검사용 프로젝트를 유지합니다: {self.project} ({self.temp})",
+                file=sys.stderr,
+            )
+            return failures
+
+        try:
+            if self.started:
                 result = self.run_compose(
-                    "down", "--volumes", "--remove-orphans", "--timeout", "20",
-                    capture=True, check=False,
+                    "down",
+                    "--volumes",
+                    "--remove-orphans",
+                    "--timeout",
+                    "20",
+                    capture=True,
+                    check=False,
                 )
                 if result.returncode != 0:
-                    failures.append(result.stderr.strip() or "Compose 자원 정리 실패")
-            except Exception as error:
-                failures.append(f"Compose 자원 정리: {error}")
-        if self.keep:
-            print(f"검사용 프로젝트를 유지합니다: {self.project} ({self.temp})", file=sys.stderr)
-        else:
-            shutil.rmtree(self.temp, ignore_errors=True)
+                    failures.append(
+                        "Compose 자원 정리: "
+                        + (result.stderr.strip() or result.stdout.strip())
+                    )
+        except (OSError, StackError, subprocess.SubprocessError) as error:
+            failures.append(f"Compose 자원 정리: {error}")
+
+        try:
+            if self.owns_images:
+                self._remove_test_images()
+        except (OSError, StackError, subprocess.SubprocessError) as error:
+            failures.append(f"이미지 태그 정리: {error}")
+
+        try:
+            shutil.rmtree(self.temp)
+        except OSError as error:
+            failures.append(f"임시 비밀 파일 정리: {error}")
         return failures
 
 
@@ -2020,6 +2077,7 @@ def parse_arguments() -> argparse.Namespace:
     )
     parser.add_argument("--keep", action="store_true", help="검사 뒤 프로젝트를 유지합니다")
     parser.add_argument("--diagnostics-dir", type=Path)
+    parser.add_argument("--project-record-dir", type=Path)
     return parser.parse_args()
 
 
@@ -2038,6 +2096,7 @@ def main() -> int:
         stack = RuntimeStack(
             keep=args.keep,
             diagnostics_dir=args.diagnostics_dir,
+            project_record_dir=args.project_record_dir,
         )
     except (OSError, StackError, subprocess.SubprocessError) as error:
         print(f"검증 환경을 준비하지 못했습니다: {error}", file=sys.stderr)
