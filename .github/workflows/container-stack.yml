@@ -1,0 +1,77 @@
+name: container-stack
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: container-stack-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 210
+    env:
+      COMPOSE_ANSI: never
+      DOCKER_BUILDKIT: "1"
+    steps:
+      - name: 소스 받기
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: 진단 경로 준비
+        run: install -d -m 0700 artifacts artifacts/projects
+
+      - name: 정적 구성 검사
+        run: make check-functional
+
+      - name: HTTPS 종단 검증
+        timeout-minutes: 25
+        run: python3 tests/runtime_stack.py e2e --diagnostics-dir artifacts/e2e --project-record-dir artifacts/projects
+
+      - name: 초기화 강제 종료 복구 검증
+        timeout-minutes: 40
+        run: python3 tests/runtime_stack.py bootstrap --diagnostics-dir artifacts/bootstrap --project-record-dir artifacts/projects
+
+      - name: 영속성 검증
+        timeout-minutes: 25
+        run: python3 tests/runtime_stack.py persistence --diagnostics-dir artifacts/persistence --project-record-dir artifacts/projects
+
+      - name: 백업과 복원 검증
+        timeout-minutes: 30
+        run: python3 tests/runtime_stack.py backup-restore --diagnostics-dir artifacts/backup-restore --project-record-dir artifacts/projects
+
+      - name: 자격증명 회전 검증
+        timeout-minutes: 30
+        run: python3 tests/runtime_stack.py rotation --diagnostics-dir artifacts/rotation --project-record-dir artifacts/projects
+
+      - name: 운영 설정 검증
+        timeout-minutes: 25
+        run: python3 tests/runtime_stack.py operations --diagnostics-dir artifacts/operations --project-record-dir artifacts/projects
+
+      - name: 격리 자원 정리 확인
+        if: ${{ always() }}
+        run: python3 tools/cleanup_test_resources.py --project-record-dir artifacts/projects --report artifacts/cleanup.txt
+
+      - name: 실패 진단 업로드
+        if: ${{ failure() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: container-stack-diagnostics-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            artifacts/**/versions.txt
+            artifacts/**/compose-ps.txt
+            artifacts/**/compose-logs.txt
+            artifacts/**/compose-model.txt
+            artifacts/**/container-state.txt
+            artifacts/cleanup.txt
+          if-no-files-found: ignore
+          retention-days: 7
+          include-hidden-files: false
