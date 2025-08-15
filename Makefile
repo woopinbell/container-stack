@@ -1,19 +1,61 @@
-COMPOSE := docker compose
-COMPOSE_FILE := srcs/docker-compose.yml
-ENV_FILE ?= .env
-PROJECT_NAME ?= container-stack
-WAIT_TIMEOUT ?= 300
-BACKUP_DIR ?=
-NEW_SECRETS_DIR ?=
-DIAGNOSTICS_DIR ?= diagnostics/$(PROJECT_NAME)
-DESTROY_CONFIRM ?=
+COMPOSE 		:= docker compose
+COMPOSE_FILE 	:= srcs/docker-compose.yml
+ENV_FILE 		?= .env
+PROJECT_NAME 	?= container-stack
+WAIT_TIMEOUT 	?= 300
+CHECK_ENV_FILE 	?= .env.example
+BACKUP_DIR 		?=
+NEW_SECRETS_DIR	?=
+DIAGNOSTICS_DIR	?= diagnostics/$(PROJECT_NAME)
+DESTROY_CONFIRM	?=
 
-COMPOSE_RUN := $(COMPOSE) --project-name $(PROJECT_NAME) --env-file $(ENV_FILE) -f $(COMPOSE_FILE)
+COMPOSE_RUN 	:= $(COMPOSE) --project-name "$(PROJECT_NAME)" --env-file "$(ENV_FILE)" -f "$(COMPOSE_FILE)"
 
-.PHONY: up start-database start-application down build logs ps clean fclean test config config-strict smoke bootstrap-test e2e persistence backup restore backup-restore-test rotate-secrets rotation-test diagnostics operations-test verify
+.DEFAULT_GOAL 	:= help
+
+.PHONY: help check-functional up up-build start-database start-application
+.PHONY: down build logs ps fclean re test config config-strict smoke
+.PHONY: bootstrap-test e2e persistence backup restore backup-restore-test
+.PHONY: rotate-secrets rotation-test diagnostics operations-test verify
+
+help:
+	@printf '%s\n' \
+		'Usage: make <target> [VARIABLE=value]' \
+		'' \
+		'Stack:' \
+		'  up                 Reconcile and start the existing images' \
+		'  up-build           Build, reconcile, and start under one operation lock' \
+		'  start-database     Reconcile and start only MariaDB' \
+		'  start-application  Reconcile and start WordPress and nginx' \
+		'  build              Build all local images' \
+		'  down               Stop containers; preserve images and volumes' \
+		'  ps / logs          Show container state / follow logs' \
+		'  fclean             Remove volumes and local images (confirmation required)' \
+		'  re                 fclean, then rebuild and start (confirmation required)' \
+		'' \
+		'Validation:' \
+		'  check-functional   Run static checks and strict Compose parsing' \
+		'  test               Run source-level validation' \
+		'  config             Print the resolved Compose model' \
+		'  config-strict      Validate a Compose model without printing it' \
+		'  smoke              Probe the running HTTPS endpoint' \
+		'  verify             Run every static and runtime scenario serially' \
+		'' \
+		'Operations: backup, restore, rotate-secrets, diagnostics' \
+		'Test scenarios: bootstrap-test, e2e, persistence, backup-restore-test,' \
+		'                rotation-test, operations-test' \
+		'' \
+		'Common variables: PROJECT_NAME, ENV_FILE, WAIT_TIMEOUT, CHECK_ENV_FILE'
+
+check-functional:
+	python3 tests/validate_stack.py --functional
+	$(MAKE) config-strict ENV_FILE="$(CHECK_ENV_FILE)"
 
 up:
 	python3 tools/start_stack.py start --project "$(PROJECT_NAME)" --env-file "$(ENV_FILE)" --wait-timeout "$(WAIT_TIMEOUT)"
+
+up-build:
+	python3 tools/start_stack.py start --project "$(PROJECT_NAME)" --env-file "$(ENV_FILE)" --wait-timeout "$(WAIT_TIMEOUT)" --build
 
 start-database:
 	python3 tools/start_stack.py database --project "$(PROJECT_NAME)" --env-file "$(ENV_FILE)" --wait-timeout "$(WAIT_TIMEOUT)"
@@ -33,14 +75,15 @@ logs:
 ps:
 	$(COMPOSE_RUN) ps
 
-clean: down
-
 fclean:
 	@test -n "$(PROJECT_NAME)" && test "$(DESTROY_CONFIRM)" = "$(PROJECT_NAME)" || { \
 		echo "볼륨과 로컬 이미지를 삭제하려면 DESTROY_CONFIRM=$(PROJECT_NAME)을 지정하십시오." >&2; \
 		exit 2; \
 	}
 	$(COMPOSE_RUN) down -v --rmi local --remove-orphans
+
+re: fclean
+	$(MAKE) up-build
 
 config:
 	$(COMPOSE_RUN) config
@@ -53,7 +96,7 @@ config-strict:
 test:
 	python3 tests/validate_stack.py
 	@if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then \
-		$(COMPOSE) --env-file .env.example -f $(COMPOSE_FILE) config >/dev/null; \
+		$(COMPOSE) --env-file .env.example -f "$(COMPOSE_FILE)" config >/dev/null; \
 		echo "docker compose config passed"; \
 	else \
 		echo "docker compose not available; skipped compose config"; \
