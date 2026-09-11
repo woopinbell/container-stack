@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
 """격리된 Compose 프로젝트에서 컨테이너 스택의 실제 동작을 검사합니다."""
 
-# tests/validate_stack.py가 "소스 코드가 그렇게 생겼는지"만 보는 정적 검사라면, 이 파일은 실제로
-# 이미지를 빌드하고 컨테이너를 띄워 동작을 검사하는 런타임 시나리오다. RuntimeStack 하나가
-# 완전히 격리된 Compose 프로젝트 하나(고유한 프로젝트 이름·포트·비밀 파일·.env)를 표현하고,
+# [INTV:ARCH] tests/validate_stack.py가 "소스 코드가 그렇게 생겼는지"만 보는 정적 검사라면, 이 파일은
+# 실제로 이미지를 빌드하고 컨테이너를 띄워 동작을 검사하는 런타임 시나리오다(CI가 이 파일을 6가지
+# 시나리오 인자로 6번 나눠 호출한다 — .github/workflows/container-stack.yml 참고). RuntimeStack
+# 하나가 완전히 격리된 Compose 프로젝트 하나(고유한 프로젝트 이름·포트·비밀 파일·.env)를 표현하고,
 # tools/*.py를 라이브러리로 import해서 함수를 직접 부르는 대신 실제 사용자처럼 `python3 tools/xxx.py`를
 # 서브프로세스로 실행해 검사한다 — CLI 인터페이스 자체가 문서화된 대로 동작하는지까지 확인하는
 # 블랙박스 통합 테스트를 지향하는 설계다. 시나리오는 6가지(main() 하단 참고): bootstrap(부트스트랩
 # 도중 강제종료 후 복구), e2e(정상 경로 종단 검증), persistence(재기동 뒤 데이터 보존),
 # backup-restore(백업/복원과 그 실패·중단 처리), rotation(비밀값 회전과 롤백), operations(리소스 제한·
-# 네트워크 격리·진단 도구 등 운영 기능)
+# 네트워크 격리·진단 도구 등 운영 기능).
 from __future__ import annotations
 
 import argparse
@@ -52,18 +53,19 @@ def require_command(name: str) -> None:
 
 
 def reserve_port() -> int:
-    # 포트 0으로 바인드하면 커널이 현재 비어있는 임시 포트를 하나 골라준다 — 여러 시나리오를
-    # 동시에 돌려도 서로 다른 HTTPS 포트를 쓰게 되어 충돌하지 않는다(다만 소켓을 곧바로 닫으므로
-    # 그 사이 다른 프로세스가 같은 포트를 채갈 여지는 남는다 — 아래 start()의 재시도 로직이 그 경우를 처리)
+    # [INTV:EDGE] 포트 0으로 바인드하면 커널이 현재 비어있는 임시 포트를 하나 골라준다 — 여러
+    # 시나리오를 동시에 돌려도 서로 다른 HTTPS 포트를 쓰게 되어 충돌하지 않는다(다만 소켓을
+    # 곧바로 닫으므로 그 사이 다른 프로세스가 같은 포트를 채갈 여지는 남는다 — 아래 start()의
+    # 재시도 로직이 그 경우를 처리).
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
         listener.bind(("127.0.0.1", 0))
         return int(listener.getsockname()[1])
 
 
-# write_private/replace_private: tools/stack_runtime.py, tools/rotate_secrets.py에서 이미 설명한 것과 같은
-# "0600 권한으로 새로 만들기" / "임시 파일에 쓰고 원자적으로 교체하기" 패턴을 테스트 코드 쪽에서
-# 독립적으로 재구현한 것 — 테스트가 만드는 가짜 비밀 파일·.env도 운영 코드가 기대하는 것과 같은
-# 권한 모델을 지켜야 검증이 의미가 있기 때문
+# [INTV:ARCH] write_private/replace_private: tools/stack_runtime.py, tools/rotate_secrets.py에서
+# 이미 쓰인 것과 같은 "0600 권한으로 새로 만들기" / "임시 파일에 쓰고 원자적으로 교체하기" 패턴을
+# 테스트 코드 쪽에서 독립적으로 재구현한 것 — 테스트가 만드는 가짜 비밀 파일·.env도 운영 코드가
+# 기대하는 것과 같은 권한 모델을 지켜야 검증이 의미가 있기 때문.
 def write_private(path: Path, value: str) -> None:
     descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
@@ -517,10 +519,15 @@ class RuntimeStack:
         )
         return result.stdout
 
+    # [INTV:ARCH] CI가 e2e 시나리오로 호출하는 진입점 — "정상 경로가 처음부터 끝까지 실제로 동작
+    # 하는가"를 확인하는, 6개 시나리오 중 가장 기본적인 것. 순서: 포트 충돌 복구 확인 -> 레거시
+    # 설정 마이그레이션 확인 -> 비밀값이 런타임에 새어나가지 않는지 확인 -> 고정해둔 WordPress/
+    # WP-CLI 버전이 실제 실행 버전과 일치하는지 -> /healthz 응답 -> 글을 하나 실제로 작성하고 그
+    # 내용이 HTTPS로 다시 읽히는지까지(가장 사용자에 가까운 종단 검증).
     def verify_e2e(self) -> None:
-        # 예약해둔 포트를 일부러 다른 소켓으로 미리 점유해, start()의 포트 충돌 감지·재시도 경로
-        # (위 start() 주석 참고)가 실제로 동작하는지부터 확인한다 — "테스트 대상 기능을 위한 테스트"가
-        # 시나리오 맨 앞에 끼워져 있는 셈
+        # [INTV:EDGE] 예약해둔 포트를 일부러 다른 소켓으로 미리 점유해, start()의 포트 충돌 감지·
+        # 재시도 경로가 실제로 동작하는지부터 확인한다 — "테스트 대상 기능을 위한 테스트"가 시나리오
+        # 맨 앞에 끼워져 있는 셈.
         blocked_port = self.port
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
             listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -618,6 +625,11 @@ class RuntimeStack:
         if self.fetch(f"/wp-content/uploads/{filename}") != file_value:
             raise StackError("재기동 뒤 업로드 파일이 보존되지 않았습니다")
 
+    # [INTV:ARCH] CI가 persistence 시나리오로 호출하는 진입점 — 컨테이너를 "다시 띄웠을 때도" 데이터가
+    # 남아있는지 검증한다(단순히 떠 있는 동안 잘 동작하는지와는 다른 질문). 글/옵션값/업로드 파일을
+    # 만들어두고 스택을 내렸다 올린 뒤(아래에서 볼륨 개수 확인 후 재시작), 그 값들이 그대로 읽히는지
+    # 확인하는 흐름 — 이름 있는 볼륨(named volume)에 실제로 마운트가 걸려 있지 않으면 컨테이너
+    # 재생성 시 데이터가 통째로 날아가는 실수를 잡아낸다.
     def verify_persistence(self) -> None:
         self.start()
         nonce = secrets.token_hex(8)
@@ -924,10 +936,11 @@ class RuntimeStack:
             "find /var/www/config -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +",
         )
 
-    # mariadb/wordpress entrypoint 스크립트가 정의한 모든 pause_after 단계 이름을 하나씩 순회하며
-    # "그 단계 직후 SIGKILL로 죽었다가, 부트스트랩을 처음부터 다시 실행했을 때 올바른 최종 상태로
-    # 수렴하는가"를 확인한다 — 부트스트랩 스크립트의 멱등성(같은 단계에서 몇 번을 다시 죽고 되살아나도
-    # 결과가 같아야 함)을 단계별로 촘촘하게 검증하는 것이 이 시나리오의 핵심
+    # [INTV:ARCH] CI가 bootstrap 시나리오로 호출하는 진입점 — 6개 시나리오 중 타임아웃이 가장 긴
+    # 이유가 여기 있다. mariadb/wordpress entrypoint 스크립트가 정의한 모든 pause_after 단계 이름을
+    # 하나씩 순회하며 "그 단계 직후 SIGKILL로 죽었다가, 부트스트랩을 처음부터 다시 실행했을 때
+    # 올바른 최종 상태로 수렴하는가"를 확인한다 — 부트스트랩 스크립트의 멱등성(같은 단계에서 몇 번을
+    # 다시 죽고 되살아나도 결과가 같아야 함)을 단계별로 촘촘하게 검증하는 것이 이 시나리오의 핵심.
     def verify_bootstrap_recovery(self) -> None:
         self.started = True
         self.run_compose(
@@ -1255,11 +1268,12 @@ class RuntimeStack:
                     timeout=PROCESS_TIMEOUT_SECONDS,
                 )
 
-    # 이 시나리오는 백업/복원 도구를 정상 경로뿐 아니라 "기존 출력 보존", "dangling 심볼릭 링크 거부",
-    # "중간 실패 주입 후 정리", "신호로 중단 후 정리", "대용량 파일·대용량 DB 값의 무결성", "이미 자원이
-    # 있는 대상에 대한 복원 거부"까지 한 번에 훑는다. 아래에서 32MiB 랜덤 파일과 4MiB짜리 DB 값을
-    # 일부러 만들어 체크섬/길이로 비교하는 것은, 작은 텍스트만으로는 안 드러나는 스트리밍·버퍼 처리
-    # 버그(예: 큰 데이터가 중간에 잘리는 문제)까지 잡기 위함
+    # [INTV:ARCH] CI가 backup-restore 시나리오로 호출하는 진입점 — 백업/복원 도구를 정상 경로뿐
+    # 아니라 "기존 출력 보존", "dangling 심볼릭 링크 거부", "중간 실패 주입 후 정리", "신호로 중단 후
+    # 정리", "대용량 파일·대용량 DB 값의 무결성", "이미 자원이 있는 대상에 대한 복원 거부"까지 한
+    # 번에 훑는다. 아래에서 32MiB 랜덤 파일과 4MiB짜리 DB 값을 일부러 만들어 체크섬/길이로 비교하는
+    # 것은, 작은 텍스트만으로는 안 드러나는 스트리밍·버퍼 처리 버그(예: 큰 데이터가 중간에 잘리는
+    # 문제)까지 잡기 위함.
     def verify_backup_restore(self) -> None:
         self.start()
         self._verify_pause_signal_race()
@@ -1760,12 +1774,15 @@ if ($text === false || !preg_match($pattern, $text, $matches) || !hash_equals($p
         self._assert_no_rotation_temporary_files()
         self.assert_runtime_secret_boundary(expected)
 
-    # 흐름: (1) 정상 회전 한 번 → (2) rotate_secrets.py의 FAILURE_STAGES 각 단계마다 실패를 주입해
-    # 그때마다 롤백이 이전 상태로 완전히 되돌리는지 확인 → (3) 신호로 중단시킨 회전도 롤백되는지 확인 →
-    # (4) 롤백 직후 "같은 입력 파일"로 다시 회전을 시도했을 때 이번엔 성공하는지(재시도 가능성) 확인 →
-    # (5) 이 시나리오 동안 등장했던 모든 비밀값 집합이 Compose 로그 어디에도 남지 않았는지 마지막에 총정리.
-    # 입력 비밀 파일들의 스냅샷(assert_input_unchanged)을 매번 비교하는 것은, 회전 도구가 실패하든
-    # 성공하든 "새 비밀값이 적힌 원본 디렉터리 자체"는 절대 건드리지 않아야 한다는 계약을 확인하기 위함
+    # [INTV:ARCH] [INTV:FLOW] CI가 rotation 시나리오로 호출하는 진입점.
+    # - [FLOW] 1. 정상 회전 한 번 -> 2. rotate_secrets.py의 FAILURE_STAGES 각 단계마다 실패를
+    #   주입해 그때마다 롤백이 이전 상태로 완전히 되돌리는지 확인 -> 3. 신호로 중단시킨 회전도
+    #   롤백되는지 확인 -> 4. 롤백 직후 "같은 입력 파일"로 다시 회전을 시도했을 때 이번엔
+    #   성공하는지(재시도 가능성) 확인 -> 5. 이 시나리오 동안 등장했던 모든 비밀값 집합이 Compose
+    #   로그 어디에도 남지 않았는지 마지막에 총정리.
+    # [INTV:EDGE] 입력 비밀 파일들의 스냅샷(assert_input_unchanged)을 매번 비교하는 것은, 회전
+    # 도구가 실패하든 성공하든 "새 비밀값이 적힌 원본 디렉터리 자체"는 절대 건드리지 않아야 한다는
+    # 계약을 확인하기 위함.
     def verify_secret_rotation(self) -> None:
         self.start()
         initial_values = dict(self.credential_values)
@@ -1866,11 +1883,18 @@ if ($text === false || !preg_match($pattern, $text, $matches) || !hash_equals($p
                     raise StackError("Compose 로그에 자격증명 값이 포함되었습니다")
         print("secret rotation, ambiguous failures, rollback, and retry passed")
 
-    # 이 시나리오는 세 갈래로 나뉜다: (1) docker inspect로 얻은 실제 컨테이너의 자원 제한·로그 정책·
-    # 보안 옵션·네트워크 소속을 docker-compose.yml에 선언된 값(값 자체는 이 함수 안 expected에 다시
-    # 못박아 둠)과 하나하나 비교, (2) `make fclean`이 DESTROY_CONFIRM 없이는 절대 실행되지 않는지
-    # 확인(Makefile의 안전장치 검증), (3) tools/diagnose_stack.py가 비밀값을 실제로 가리는지, 못 읽는
-    # 비밀 파일이 있으면 아예 중단하는지, 기존 결과·심볼릭 링크 출력 경로를 거부하는지를 확인
+    # [INTV:ARCH] CI가 operations 시나리오로 호출하는, 6개 중 마지막 진입점 — 세 갈래로 나뉜다:
+    # (1) docker inspect로 얻은 실제 컨테이너의 자원 제한·로그 정책·보안 옵션·네트워크 소속을
+    # docker-compose.yml에 선언된 값(값 자체는 이 함수 안 expected에 다시 못박아 둠)과 하나하나
+    # 비교, (2) `make fclean`이 DESTROY_CONFIRM 없이는 절대 실행되지 않는지 확인(Makefile의
+    # 안전장치 검증), (3) tools/diagnose_stack.py가 비밀값을 실제로 가리는지, 못 읽는 비밀 파일이
+    # 있으면 아예 중단하는지, 기존 결과·심볼릭 링크 출력 경로를 거부하는지를 확인.
+    # [INTV:TRAP] expected 딕셔너리에 memory/nano_cpus/pids 등을 docker-compose.yml과 별개로
+    # 다시 하드코딩해두는 방식은, compose 파일에서 자원 제한 값을 바꾸면 이 테스트도 반드시 함께
+    # 고쳐야 하는 강한 결합을 만든다 — compose 파일 값을 파싱해서 자동으로 비교하는 대신 값을
+    # 직접 못박아 둔 이유는, "docker inspect가 compose 파일에 적힌 값을 실제로 그대로 반영했는지"
+    # 자체를 검증하려는 것이라 compose 파일을 다시 파싱해 비교 기준으로 삼으면 그 목적 자체가
+    # 순환 논리가 되기 때문이다.
     def verify_operations(self) -> None:
         self.start()
         expected = {
@@ -2231,9 +2255,12 @@ def main() -> int:
         print(f"검증 환경을 준비하지 못했습니다: {error}", file=sys.stderr)
         return 2
 
-    # failed는 "정상적으로 끝까지 성공했는가"의 반대 표시로 시작해(True), try 블록이 예외 없이 끝까지
-    # 돌면 그제서야 False로 내려간다 — finally의 close(failed=failed)가 이 값으로 "실패했을 때만
-    # 진단 자료를 남긴다"는 위 close()의 분기를 결정한다
+    # [INTV:TRAP] failed는 "정상적으로 끝까지 성공했는가"의 반대 표시로 시작해(True), try 블록이
+    # 예외 없이 끝까지 돌면 그제서야 False로 내려간다 — finally의 close(failed=failed)가 이 값으로
+    # "실패했을 때만 진단 자료를 남긴다"는 위 close()의 분기를 결정한다. 재구현 시 이 변수를
+    # False로 시작하면, try 블록 도중 예외가 나서 except로 빠지고 failed=False를 대입하는 코드
+    # 라인 자체를 못 지나가는 경우에도 여전히 "실패 아님" 상태로 남아 진단 자료가 하나도 안
+    # 남는(정작 필요할 때 비어있는) 흔한 실수가 된다.
     failed = True
     result = 0
     try:

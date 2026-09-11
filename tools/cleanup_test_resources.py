@@ -1,6 +1,13 @@
 #!/usr/bin/env python3
 """현재 검증이 기록한 Compose 프로젝트의 잔여 자원만 회수합니다."""
 
+# [INTV:ARCH] CI(container-stack.yml)의 "격리 자원 정리 확인" 스텝이 6개 시나리오가 전부 끝난
+# 뒤(성공/실패 무관하게 if: always()) 이 스크립트를 한 번 호출한다 — RuntimeStack.close()가 각
+# 시나리오 자신의 컨테이너/볼륨/네트워크/이미지를 정상적으로 정리하는 것과는 별개의, 마지막
+# 안전망이다. "project_record_dir"(각 RuntimeStack이 자기 프로젝트 이름을 파일로 남겨둔 디렉터리)에
+# 기록된 프로젝트명으로만 docker 자원을 필터링해 지운다 — docker에 떠 있는 아무 컨테이너나 라벨
+# 없이 지우면 CI 러너에 우연히 같이 떠 있는 무관한 컨테이너까지 건드릴 위험이 있어, 반드시 "이번
+# 실행이 스스로 만들었다고 기록해둔 프로젝트"로만 범위를 좁힌다.
 from __future__ import annotations
 
 import argparse
@@ -124,6 +131,13 @@ def write_private(path: Path, text: str) -> None:
         stream.write(text)
 
 
+# [INTV:TRAP] 반환값이 세 갈래(0/1/2)이고, 1도 실패로 취급된다는 점이 이 스크립트의 핵심 설계다 —
+# 0(자원 없음)만 "완전히 정상"이고, 1(자원을 찾았지만 전부 회수는 성공)조차도 exit code가 0이
+# 아니라서 이 스텝을 실패로 만든다. 얼핏 "지웠으면 성공 아닌가" 싶지만, 정상적인 실행이라면
+# RuntimeStack.close()가 이미 자기 몫을 다 지웠어야 하므로, 이 스크립트가 여기서 뭔가를 "찾았다"는
+# 사실 자체가 "어떤 시나리오의 자체 정리 로직이 실패했다"는 신호다 — 그 실패를 자동 복구(회수)
+# 해주면서도 CI에는 여전히 빨간불을 띄워, 조용히 넘어가지 않고 사람이 원인을 조사하게 만든다.
+# 2(회수 자체도 일부 실패)는 그보다 더 심각한, 사람이 직접 개입해야 할 상태.
 def cleanup(project_record_dir: Path, report: Path | None) -> int:
     projects = load_projects(project_record_dir)
     discovered: dict[str, list[tuple[str, str]]] = {

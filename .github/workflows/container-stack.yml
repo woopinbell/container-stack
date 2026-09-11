@@ -1,14 +1,32 @@
+# [INTV:ARCH] 이 워크플로는 "정적 검증 1단계 + 실제로 스택을 띄워보는 시나리오 6단계"를 한 job
+# 안에서 순서대로 쌓아 올리는 구조다(job을 여러 개로 쪼개지 않은 이유는 각 시나리오가 독립된
+# 프로젝트명/포트로 스택을 새로 띄우고 끝에 정리까지 하는 무거운 작업이라, 병렬로 여러 개를
+# 동시에 돌리면 CI 러너의 Docker 자원을 두고 서로 경쟁하게 되기 때문 — 아래 concurrency 설정도
+# 같은 문제의식에서 나온 것). GitHub Actions 문법 자체(트리거/job/matrix 등)에 대한 개념 설명은
+# miniRT의 .github/workflows/ci.yml 상단에 모아뒀다.
 name: container-stack
 
+# [INTV:ARCH] main으로 향하는 push/PR에만 한정 — 기능 브랜치 단계의 커밋마다 이 무거운(job
+# 타임아웃이 210분) 스택 통합 테스트를 전부 돌리면 CI 큐가 이 워크플로 하나에 오래 묶여, 정말
+# 병합 직전에만 확인해도 되는 검증을 너무 자주 반복하게 된다.
 on:
   push:
     branches: [main]
   pull_request:
     branches: [main]
 
+# [INTV:EDGE] GITHUB_TOKEN에 저장소 읽기 권한만 명시적으로 부여 — 이 워크플로는 컨테이너를
+# 로컬에 띄우고 지우기만 할 뿐 그 토큰으로 리포지토리에 쓰기 작업(코멘트, 릴리스 등)을 하지
+# 않으므로, 기본으로 부여될 수 있는 더 넓은 권한을 여기서 먼저 좁혀 토큰이 탈취/오용됐을 때의
+# 피해 범위를 줄인다.
 permissions:
   contents: read
 
+# [INTV:EDGE] 같은 PR/브랜치에 커밋을 연달아 push하면, group 키(워크플로 이름 + 브랜치/PR 참조)가
+# 같은 이전 실행을 cancel-in-progress로 즉시 취소한다 — 이 워크플로 하나가 최대 210분까지 걸릴 수
+# 있는데, 취소 없이 뒀다면 "3번 연속 push"만 해도 오래된 실행 3개가 동시에 Docker 컨테이너를
+# 띄우며 자원을 다투게 된다. 최신 커밋의 결과만 실제로 필요하다는 점에서, 오래된 실행은 끝까지
+# 볼 필요가 없다.
 concurrency:
   group: container-stack-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -16,27 +34,51 @@ concurrency:
 jobs:
   verify:
     runs-on: ubuntu-24.04
+    # [INTV:EDGE] 210분이라는 넉넉한 타임아웃은 아래 6개 시나리오 각각의 timeout-minutes 합(약
+    # 175분) + 여유분 — 개별 스텝 타임아웃이 "그 시나리오 하나가 멈췄을 때" 잡아주는 안전장치라면,
+    # job 전체 타임아웃은 "여러 스텝이 조금씩 늦어져 합계가 예상을 넘어서는" 상황을 잡아주는
+    # 이중 안전장치다.
     timeout-minutes: 210
     env:
       COMPOSE_ANSI: never
+      # [INTV:TRAP] DOCKER_BUILDKIT=1을 job 레벨 env로 미리 고정해두지 않으면, 러너 이미지의
+      # Docker 기본 설정이 바뀔 때(BuildKit이 기본 비활성인 환경으로) 이 워크플로가 기대하는
+      # 빌드 캐시/병렬 빌드 동작이 조용히 레거시 빌더로 바뀌어버릴 수 있다 — CI 환경의 기본값에
+      # 의존하지 않고 명시적으로 고정하는 방어.
       DOCKER_BUILDKIT: "1"
     steps:
       - name: 소스 받기
         uses: actions/checkout@v4
+        # [INTV:EDGE] persist-credentials: false — checkout이 기본으로 남겨두는 Git 자격증명을
+        # 이후 스텝(대부분 docker/python 명령)에서 아예 쓸 일이 없는데도 계속 러너 파일시스템에
+        # 남겨두면, 혹시 이후 스텝 중 하나가 오염되거나 의도치 않게 외부 코드를 실행할 경우 그
+        # 자격증명이 함께 유출될 표면적이 된다 — 최소 권한 원칙을 checkout 단계까지 확장한 것.
         with:
           persist-credentials: false
 
       - name: 진단 경로 준비
+        # [INTV:EDGE] 0700(소유자만 rwx)으로 미리 디렉터리를 만들어두는 이유 — 아래 시나리오들이
+        # 여기에 비밀 설정값이 섞인 진단 정보(compose 모델, 컨테이너 상태 등)를 남기는데, 기본
+        # umask에 맡기면 다른 프로세스도 읽을 수 있는 권한으로 생성될 수 있다.
         run: install -d -m 0700 artifacts artifacts/projects
 
       - name: 정적 구성 검사
         run: make check-functional
 
+      # [INTV:FLOW] 여기부터 실제 스택을 띄워보는 6개 시나리오 — 하나가 실패해도 GitHub Actions
+      # 기본 동작상 뒤 스텝은 건너뛰지만, 각 시나리오가 서로 다른 --diagnostics-dir로 격리되어
+      # 있어 "이번 실행에서 어디까지 통과했는지"는 남은 artifacts/ 하위 디렉터리만 봐도 알 수
+      # 있다. 순서는 대략 "가장 흔한 정상 경로(e2e) -> 장애 복구 -> 데이터 보존 -> 운영 작업"
+      # 순으로, 앞 단계가 이미 깨졌다면 뒤의 더 복잡한 시나리오까지 갈 필요가 없다는 실용적 배치다.
       - name: HTTPS 종단 검증
         timeout-minutes: 25
         run: python3 tests/runtime_stack.py e2e --diagnostics-dir artifacts/e2e --project-record-dir artifacts/projects
 
       - name: 초기화 강제 종료 복구 검증
+        # [INTV:EDGE] 6개 시나리오 중 타임아웃이 가장 긴(40분) 이유 — 이 시나리오는 스택을
+        # 부팅하는 도중 일부러 강제 종료시킨 뒤 재기동이 정상적으로 복구되는지 확인하는데,
+        # "정상 기동 대기 + 강제 종료 + 재기동 대기 + 최종 상태 확인"까지 폴링 대기 구간이
+        # 여러 번 겹쳐 다른 단일 시나리오보다 구조적으로 더 오래 걸린다.
         timeout-minutes: 40
         run: python3 tests/runtime_stack.py bootstrap --diagnostics-dir artifacts/bootstrap --project-record-dir artifacts/projects
 
@@ -57,13 +99,24 @@ jobs:
         run: python3 tests/runtime_stack.py operations --diagnostics-dir artifacts/operations --project-record-dir artifacts/projects
 
       - name: 격리 자원 정리 확인
+        # [INTV:EDGE] if: always() — 앞의 6개 시나리오 중 하나가 실패해서 뒤 스텝들이 건너뛰어진
+        # 상황에서도, "각 시나리오가 만든 컨테이너/네트워크/볼륨을 실제로 다 정리했는지 확인"하는
+        # 이 스텝만큼은 항상 실행돼야 한다 — 그렇지 않으면 실패한 실행일수록 오히려 정리 여부를
+        # 검증받지 못한 채 러너가 재활용되고, 좀비 자원이 다음 실행에 영향을 줄 수 있다.
         if: ${{ always() }}
         run: python3 tools/cleanup_test_resources.py --project-record-dir artifacts/projects --report artifacts/cleanup.txt
 
       - name: 실패 진단 업로드
+        # [INTV:EDGE] if: failure() — 성공한 실행에서는 진단 파일을 굳이 보존할 필요가 없어
+        # (남겨봐야 실패 원인 조사에 쓰이지 않는다), 실패했을 때만 업로드해서 Actions 저장소
+        # 용량과 보존 기간(retention-days)을 실제로 조사가 필요한 실행에만 쓰게 한다.
         if: ${{ failure() }}
         uses: actions/upload-artifact@v4
         with:
+          # [INTV:TRAP] 아티팩트 이름에 github.run_id + github.run_attempt를 함께 넣는 이유 —
+          # run_id만 쓰면 "Re-run failed jobs"로 같은 워크플로 실행을 재시도했을 때 이름이
+          # 충돌해 이전 시도의 아티팩트를 덮어써 버린다. run_attempt까지 포함해야 재시도별로
+          # 별개의 아티팩트로 남는다.
           name: container-stack-diagnostics-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
             artifacts/**/versions.txt
@@ -72,6 +125,10 @@ jobs:
             artifacts/**/compose-model.txt
             artifacts/**/container-state.txt
             artifacts/cleanup.txt
+          # [INTV:EDGE] if-no-files-found: ignore — 앞의 시나리오들이 전부 아주 초반(정적 검사
+          # 단계)에 실패해 아직 artifacts/ 하위 파일이 하나도 안 만들어진 상태일 수도 있는데,
+          # 기본값(warn/error)이었다면 "업로드할 파일이 없다"는 이유만으로 이 스텝 자체가 다시
+          # 실패 처리되어 진짜 원인(정적 검사 실패)이 로그에 묻힐 수 있다.
           if-no-files-found: ignore
           retention-days: 7
           include-hidden-files: false

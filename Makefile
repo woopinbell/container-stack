@@ -52,13 +52,22 @@ help:
 		'' \
 		'Common variables: PROJECT_NAME, ENV_FILE, WAIT_TIMEOUT, CHECK_ENV_FILE'
 
+# [INTV:ARCH] CI(container-stack.yml)의 "정적 구성 검사" 스텝이 바로 이 타겟을 호출한다 — 실제로
+# 컨테이너를 하나도 띄우지 않고 끝나는, 이 프로젝트에서 가장 저렴한 검증 단계. 두 스텝으로 구성:
+# (1) validate_stack.py --functional로 소스/설정 파일 자체의 정적 규칙(아래 tests/validate_stack.py
+# 참고)을, (2) config-strict로 실제 Compose 스키마 파싱을 검증한다 — 둘 다 컨테이너를 안 띄우므로
+# CI의 6개 런타임 시나리오보다 훨씬 빠르게 "가장 흔한 실수"부터 걸러낸다.
 check-functional:
 	python3 tests/validate_stack.py --functional
-	# $(MAKE)로 자기 자신을 재귀 호출하면서 ENV_FILE만 예제 파일로 바꿔치기 — 실제 비밀값 없이도(.env.example로) compose 설정 자체의 구문/스키마 오류를 잡기 위한 설계
+	# [INTV:TRAP] $(MAKE)로 자기 자신을 재귀 호출하면서 ENV_FILE만 예제 파일로 바꿔치기 — 실제
+	# 비밀값 없이도(.env.example로) compose 설정 자체의 구문/스키마 오류를 잡기 위한 설계. 이
+	# 타겟을 실제 .env로만 테스트하면, 비밀값을 가진 사람의 로컬 환경에서는 통과하지만 그 비밀값이
+	# 없는 CI/신규 기여자 환경에서는 애초에 config 파싱조차 안 되는 문제를 놓친다.
 	$(MAKE) config-strict ENV_FILE="$(CHECK_ENV_FILE)"
 
+# [INTV:ARCH] 이 Makefile은 오케스트레이션 로직을 직접 담지 않고 python 스크립트에 위임하는 얇은
+# CLI 래퍼 — 실제 대기/헬스체크/롤백 판단은 tools/start_stack.py 쪽 책임.
 up:
-	# 이 Makefile은 오케스트레이션 로직을 직접 담지 않고 python 스크립트에 위임하는 얇은 CLI 래퍼 — 실제 대기/헬스체크/롤백 판단은 tools/start_stack.py 쪽 책임
 	python3 tools/start_stack.py start --project "$(PROJECT_NAME)" --env-file "$(ENV_FILE)" --wait-timeout "$(WAIT_TIMEOUT)"
 
 up-build:

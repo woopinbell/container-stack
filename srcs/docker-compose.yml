@@ -163,10 +163,10 @@ services:
 networks:
   frontend:
     driver: bridge
+  # [INTV:ARCH] internal: true — 호스트/외부로 나가는 경로가 없는 격리망. mariadb를 backend에만 둠으로써
+  # "DB는 애초에 외부와 통신할 방법이 없다"는 것을 애플리케이션 로직이 아니라 네트워크 레벨에서 강제한다.
   backend:
     driver: bridge
-    # [INTV:ARCH] internal: true — 호스트/외부로 나가는 경로가 없는 격리망. mariadb를 backend에만 둠으로써
-    # "DB는 애초에 외부와 통신할 방법이 없다"는 것을 애플리케이션 로직이 아니라 네트워크 레벨에서 강제한다.
     internal: true
 
 volumes:
