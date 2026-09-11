@@ -1,3 +1,7 @@
+# [INTV:ARCH] "x-" 접두사 키는 Docker Compose가 정한 확장 필드 규약 — Compose 자체는 이 값을 실행에
+# 쓰지 않고 무시한다. 여기 적힌 경로들은 tools/ 아래 부트스트랩·시크릿 로테이션 스크립트가 "어떤 시크릿
+# 파일이 어떤 서비스 것인지" 참조하기 위해 한 곳에 정리해 둔 것 — Compose 실행과는 독립적인 프로젝트
+# 내부 규약이다.
 x-secret-files:
   db_root_password: ${DB_ROOT_PASSWORD_FILE:-../secrets/db_root_password.txt}
   db_password: ${DB_PASSWORD_FILE:-../secrets/db_password.txt}
@@ -10,6 +14,8 @@ services:
       context: ./requirements/nginx
     image: ${STACK_IMAGE_PREFIX:-container-stack}-nginx:${STACK_IMAGE_TAG:-local}
     restart: unless-stopped
+    # [INTV:PERF] [INTV:EDGE] cpus/mem_limit/pids_limit/ulimits — 컨테이너 하나가 호스트 자원(CPU·메모리·
+    # 프로세스 수·파일 디스크립터)을 과점해 다른 서비스에 영향을 주는 "noisy neighbor"를 막는 상한선.
     cpus: ${NGINX_CPUS:-0.50}
     mem_limit: ${NGINX_MEMORY:-128m}
     pids_limit: ${NGINX_PIDS_LIMIT:-64}
@@ -17,9 +23,13 @@ services:
       nofile:
         soft: ${NGINX_NOFILE_SOFT:-1024}
         hard: ${NGINX_NOFILE_HARD:-4096}
+    # [INTV:EDGE] nginx는 SIGQUIT을 "진행 중인 요청을 끝내고 정상 종료"로 처리한다 — 기본 종료 신호인
+    # SIGTERM보다 덜 거친 그레이스풀 셧다운 방식.
     stop_signal: SIGQUIT
     stop_grace_period: 15s
     security_opt:
+      # [INTV:EDGE] no-new-privileges: 컨테이너 내부 프로세스가 setuid 등으로 실행 중 권한을 더 높이는
+      # 것을 커널이 차단하는 하드닝 옵션.
       - no-new-privileges:true
     logging:
       driver: json-file
@@ -27,17 +37,27 @@ services:
         max-size: "10m"
         max-file: "3"
     environment:
+      # [INTV:EDGE] ${VAR:?메시지} — VAR가 비어 있으면 기본값으로 채우는 대신 컨테이너 기동 자체를
+      # 실패시키는 필수값 표기. "조용히 잘못된 기본값으로 뜨는 것"보다 "즉시 실패"를 택한 fail-fast 설계.
       DOMAIN_NAME: ${DOMAIN_NAME:?set DOMAIN_NAME}
     ports:
+      # [INTV:EDGE] "바인드주소:호스트포트:컨테이너포트" 형식. 바인드주소 기본값이 127.0.0.1이라 별도
+      # 설정이 없으면 호스트 로컬에서만 접속되고 외부망에는 노출되지 않는다.
       - "${HTTPS_BIND_ADDRESS:-127.0.0.1}:${HTTPS_PORT:-443}:443"
     volumes:
+      # [INTV:TRADE_OFF] :ro — 워드프레스 파일을 읽기 전용으로 마운트. nginx가 정적 파일을 직접 서빙할
+      # 수 있게 하면서도, 이 컨테이너가 뚫리더라도 워드프레스 파일을 변조하지는 못하게 막는 심층 방어.
       - wordpress_data:/var/www/html:ro
     depends_on:
       wordpress:
+        # [INTV:ARCH] service_healthy — 단순히 "컨테이너가 떴다"가 아니라 wordpress의 healthcheck가
+        # 통과할 때까지 시작을 미루는 오케스트레이션 순서 제어.
         condition: service_healthy
     networks:
       - frontend
     healthcheck:
+      # [INTV:EDGE] 컨테이너가 자기 자신의 /healthz 엔드포인트를 로컬로 호출해 실제 요청 처리가 가능한
+      # 상태인지 확인 — 프로세스 생존이 아니라 "서비스 가능 상태"를 검사한다.
       test: ["CMD-SHELL", "curl -kfsS https://127.0.0.1/healthz >/dev/null"]
       interval: 10s
       timeout: 5s
@@ -73,6 +93,10 @@ services:
     networks:
       - backend
     healthcheck:
+      # [INTV:EDGE] 부트스트랩 완료 마커 + 소켓 존재 + PID 1(entrypoint가 exec로 넘겨준 mariadbd) 생존을
+      # 모두 확인해야 "이미지가 떴다"가 아니라 "쿼리를 받을 준비가 끝났다"는 걸 보장할 수 있다.
+      # - [TRAP] 소켓 존재만 확인하면, 부트스트랩 도중(스키마 생성 중 등) 임시로 뜬 서버도 통과시켜버려
+      #   healthcheck가 실제 준비 상태보다 먼저 성공을 보고하는 false positive가 생긴다.
       test: ["CMD-SHELL", "test -f /var/lib/mysql-volume/data/.container-stack-initialized && test -S /run/mysqld/mysqld.sock && kill -0 1"]
       interval: 10s
       timeout: 5s
@@ -103,6 +127,8 @@ services:
     environment:
       DOMAIN_NAME: ${DOMAIN_NAME:?set DOMAIN_NAME}
       WORDPRESS_URL: ${WORDPRESS_URL:?set WORDPRESS_URL}
+      # [INTV:ARCH] Compose 네트워크 안에서는 서비스 이름이 곧 DNS 호스트명이 된다 — 별도 설정 없이
+      # "mariadb"로 접속됨 (Compose의 내장 DNS 기반 서비스 디스커버리).
       WORDPRESS_DB_HOST: mariadb
       MYSQL_DATABASE: ${MYSQL_DATABASE:?set MYSQL_DATABASE}
       MYSQL_USER: ${MYSQL_USER:?set MYSQL_USER}
@@ -113,14 +139,21 @@ services:
       WORDPRESS_USER_EMAIL: ${WORDPRESS_USER_EMAIL:?set WORDPRESS_USER_EMAIL}
     volumes:
       - wordpress_data:/var/www/html
+      # [INTV:ARCH] [INTV:EDGE] wp-config.php(DB 비밀번호 등 포함)를 웹 루트와 분리된 별도 볼륨에 보관 —
+      # wordpress_data는 nginx에도 그대로 마운트되므로, 같은 곳에 두면 설정 유출 경로가 하나 늘어난다.
       - wordpress_config:/var/www/config
     depends_on:
       mariadb:
         condition: service_healthy
     networks:
+      # [INTV:ARCH] frontend(nginx와 통신)와 backend(mariadb와 통신) 양쪽에 걸치는 유일한 서비스 —
+      # nginx는 backend에, mariadb는 frontend에 속해 있지 않아서 DB는 nginx에서도 직접 도달할 수 없다
+      # (네트워크 세그멘테이션으로 공격 표면을 최소화).
       - frontend
       - backend
     healthcheck:
+      # [INTV:EDGE] cgi-fcgi로 로컬 php-fpm의 /ping 엔드포인트를 fastcgi 프로토콜로 직접 호출 — 자체
+      # HTTP 서버가 없는 php-fpm 컨테이너를 nginx 경유 없이 그 자체로 헬스체크하는 방법.
       test: ["CMD-SHELL", "test -f /var/www/html/.container-stack-initialized && REQUEST_METHOD=GET SCRIPT_NAME=/ping SCRIPT_FILENAME=/ping cgi-fcgi -bind -connect 127.0.0.1:9000 | grep -q pong"]
       interval: 10s
       timeout: 5s
@@ -132,6 +165,8 @@ networks:
     driver: bridge
   backend:
     driver: bridge
+    # [INTV:ARCH] internal: true — 호스트/외부로 나가는 경로가 없는 격리망. mariadb를 backend에만 둠으로써
+    # "DB는 애초에 외부와 통신할 방법이 없다"는 것을 애플리케이션 로직이 아니라 네트워크 레벨에서 강제한다.
     internal: true
 
 volumes:

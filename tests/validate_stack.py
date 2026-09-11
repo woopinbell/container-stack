@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+# 이 파일은 컨테이너를 실제로 띄우지 않는 "정적" 검증이다 — docker-compose.yml, Dockerfile, 셸 스크립트,
+# 다른 파이썬 도구들의 소스 코드를 텍스트/정규식으로 훑어서 "이전에 내린 설계 결정이 그대로 남아있는지"를
+# 확인한다. 예를 들어 특정 베이스 이미지 다이제스트, 체크섬 값, 심지어 다른 파일의 함수 이름까지 문자열로
+# 못박아두고 검사하는데, 이는 리팩터링 도중 의도적으로 넣어둔 방어 로직이나 고정값이 조용히 사라지는 것을
+# 잡아내기 위한 회귀 테스트 기법이다(실제 동작 검증은 tests/runtime_stack.py가 담당)
 from pathlib import Path
 import re
 import stat
@@ -31,11 +36,14 @@ def require_text(path: str, patterns: list[str]) -> str:
 
 def require_executable(path: str) -> None:
     mode = require_file(path).stat().st_mode
+    # stat.S_IXUSR — "소유자 실행" 권한 비트 하나만 뜻하는 상수. 비트 AND 결과가 0이면 그 비트가 꺼져 있다는 뜻
     if not mode & stat.S_IXUSR:
         fail(f"{path} must be executable")
 
 
 def validate_source_only() -> None:
+    # 계획 문서·메모·과거 산출물 등이 최종 제출물에 섞여 들어가지 않았는지 확인 — 코드 동작과는 무관한
+    # 저장소 구조/제출 규칙을 강제하는 검사
     forbidden = [
         "docs",
         "notes",
@@ -85,6 +93,9 @@ def validate_compose() -> None:
         fail("runtime services must not mount secret files")
     if re.search(r"^\s{6}[A-Z0-9_]*PASSWORD(?:_FILE)?:", text, re.MULTILINE):
         fail("runtime service environments must not contain passwords")
+    # (?ms): re.MULTILINE(^가 각 줄의 시작에 매치)과 re.DOTALL(.이 줄바꿈도 포함)을 정규식 안에 인라인으로 켜는 문법.
+    # 뒤의 (?=...)는 "실제로 소비하지 않고 그 지점에 다음 패턴이 있는지만 확인"하는 전방탐색(lookahead) —
+    # "nginx:" 항목 전체를, 다음 서비스 키(들여쓰기 2칸 + 소문자)가 나오기 직전까지만 잘라내는 데 쓰인다
     if "/var/www/config" in re.search(
         r"(?ms)^\s+nginx:.*?(?=^\s{2}[a-z])", text
     ).group(0):
@@ -112,6 +123,8 @@ def validate_compose() -> None:
         'max-file: "3"',
         "stop_grace_period:",
     ):
+        # 서비스마다 따로 정규식을 쓰는 대신, "이 문자열이 파일 전체에서 정확히 3번(nginx/mariadb/wordpress 각각
+        # 한 번씩) 나오는지"로 세 서비스 모두 같은 정책을 갖췄는지 한 번에 확인하는 기법
         if text.count(required) != 3:
             fail(f"all three services must set the runtime policy: {required}")
     if not re.search(r"backend:\s+driver: bridge\s+internal: true", text):
@@ -163,6 +176,9 @@ def validate_dockerfiles() -> None:
     entrypoint = require_file(
         "srcs/requirements/wordpress/tools/docker-entrypoint.sh"
     ).read_text()
+    # "wp core download"가 없어야 한다는 건 곧 "컨테이너 기동 시점에 인터넷에서 새로 워드프레스를 받지 않는다"는
+    # 뜻 — 빌드 시점에 이미 이미지 안에 검증해 넣어둔 사본을 entrypoint가 그대로 복사만 하는 설계
+    # (wordpress Dockerfile/entrypoint 주석 참고)를 테스트로 못박아 둔 것
     if (
         "wp core download" in entrypoint
         or "/usr/src/wordpress-core.sha256" not in entrypoint
@@ -212,6 +228,10 @@ def validate_env_policy() -> None:
         fail(".env.example must point to secret files instead of embedding passwords")
 
 
+# 아래 validate_tools()는 다른 도구 파일의 소스 코드 안에서 특정 함수 이름·변수명·문자열 리터럴이
+# 그대로 존재하는지를 검사한다 — "동작이 같은가"가 아니라 "그 방어 로직/구조가 코드에 실제로 남아있는가"를
+# 훨씬 싸고 빠르게(컨테이너를 띄우지 않고) 확인하는 방식. 그만큼 다른 파일을 리팩터링해 이름이 바뀌면
+# 이 목록도 함께 갱신해야 하는 강한 결합을 감수한 설계다
 def validate_tools() -> None:
     require_executable("tools/smoke_https.sh")
     require_text("tools/smoke_https.sh", [r"curl .+--connect-timeout", r"curl .+--max-time"])
@@ -382,6 +402,8 @@ def validate_tools() -> None:
 
 
 def validate_bootstrap_recovery() -> None:
+    # entrypoint 스크립트가 "부트스트랩 도중 죽었다가 재시작"하는 경로를 실제로 갖추고 있는지, 관련 핵심
+    # 식별자(마커 파일, 스테이징 디렉터리, 에러 메시지)가 여전히 소스에 남아있는지를 문자열로 확인
     require_text(
         "srcs/requirements/mariadb/tools/docker-entrypoint.sh",
         [
@@ -404,6 +426,9 @@ def validate_bootstrap_recovery() -> None:
 
 
 def validate_rotation_runtime_boundary() -> None:
+    # 비밀 회전 기능이 예전 설계(컨테이너에 /run/secrets로 비밀 파일을 직접 마운트하던 방식)로 퇴행하지
+    # 않았는지 금지어 목록으로 확인하고, 현재 설계(wp-config를 별도 볼륨에서 원자적으로 교체)에 필요한
+    # 코드 조각이 남아있는지를 함께 확인
     runtime = require_file("tests/runtime_stack.py").read_text()
     forbidden = (
         "def _mounted_secret_matches",

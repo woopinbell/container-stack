@@ -1,4 +1,8 @@
 #!/bin/sh
+# [INTV:ARCH] 이 스크립트도 mariadb entrypoint와 같은 이중 역할 구조다 — "bootstrap" 인자로 한 번
+# 호출되어 워드프레스 파일 설치·DB 계정 생성·wp-config 작성까지 마치고, 평소 기동 시에는 상태만 점검한
+# 뒤 실제 php-fpm으로 넘어간다(맨 아래 분기 참고). 공용 유틸리티(fail/require_*/pause_after/exec 패턴)는
+# mariadb entrypoint와 동일하므로 그쪽 주석을 참고하고, 여기서는 워드프레스 쪽 고유 로직만 짚는다.
 set -eu
 
 wordpress_dir="${WORDPRESS_DATA_DIR:-/var/www/html}"
@@ -76,15 +80,26 @@ wait_for_database() {
     done
 }
 
+# [INTV:ARCH] 워드프레스 "코어" 파일(wp-content 제외 전부)을 이미지 안에 미리 담아둔 원본
+# (/usr/src/wordpress)에서 실제 웹 루트로 설치/검증하는 함수. wp-content(테마/플러그인/업로드)는
+# 사용자가 바꾸는 영역이라 별도 함수(install_content_files)에서 정반대 전략으로 다룬다 — 코어는
+# "체크섬으로 무결성을 강제하는 불변 파일", wp-content는 "있으면 건드리지 않는 사용자 데이터".
 install_core_files() {
+    # [INTV:EDGE] find의 -prune으로 wp-content와 wp-config 심볼릭 링크 경로는 검사에서 제외하고, 그
+    # 나머지 범위에서 심볼릭 링크가 하나라도 있으면 실패시킨다 — 코어 파일 자리에 심볼릭 링크를 심어
+    # 엉뚱한 곳에 쓰게 만드는 공격(symlink attack)을 막기 위한 방어 코드.
     if find "$wordpress_dir" -path "${wordpress_dir}/wp-content" -prune \
         -o -path "$config_link" -prune \
         -o -type l -print | grep -q .; then
         fail "WordPress core path contains a symbolic link"
     fi
     while IFS= read -r manifest_line; do
+        # 체크섬 목록의 각 줄은 "다이제스트  ./경로" 형식(sha256sum 출력 포맷) — 앞부분/뒷부분을
+        # "${var%% 패턴}"(뒤에서부터 최長 매칭 제거) / "${var#패턴}"(앞에서부터 매칭 제거)로 분리.
         digest="${manifest_line%% *}"
         relative="${manifest_line#*  ./}"
+        # [INTV:EDGE] 목록에 담긴 경로가 절대경로거나 ".."로 상위 디렉터리를 벗어나려 하면 거부 —
+        # 경로 조작(path traversal) 방어.
         case "$relative" in
             ""|/*|../*|*/../*|*/..) fail "invalid WordPress core manifest path" ;;
         esac
@@ -95,6 +110,8 @@ install_core_files() {
         if [ -L "$target" ]; then
             fail "WordPress core target is a symbolic link: $relative"
         fi
+        # [INTV:PERF] 이미 같은 체크섬의 파일이 그 자리에 있다면 다시 복사하지 않고 건너뜀 —
+        # 재부트스트랩(컨테이너 재기동)을 반복해도 매번 전체를 다시 쓰지 않는 멱등성(idempotency) 확보.
         if [ -f "$target" ] \
             && printf '%s  %s\n' "$digest" "$target" | sha256sum -c - >/dev/null 2>&1; then
             continue
@@ -103,6 +120,9 @@ install_core_files() {
             fail "WordPress core target is not a regular file: $relative"
         fi
         base="${target##*/}"
+        # [INTV:EDGE] 같은 디렉터리 안에 임시 이름으로 먼저 쓰고 마지막에 mv로 원자적 치환 — 파일이
+        # 절반만 쓰인 상태로 다른 프로세스(php-fpm)에 보이는 순간이 생기지 않게 하는 원자적 발행
+        # 패턴(mariadb entrypoint의 스테이징-후-mv와 동일한 원칙).
         temporary="${parent}/.${base}.bootstrap.$$"
         rm -f -- "$temporary"
         cp -p -- "$source" "$temporary"
@@ -119,6 +139,8 @@ install_core_files() {
         || fail "WordPress core files are incomplete"
 }
 
+# [INTV:TRADE_OFF] wp-content는 코어와 달리 체크섬 검증을 하지 않는다 — 사용자가 테마/플러그인/업로드를
+# 자유롭게 바꾸는 영역이라, "이미 있으면 절대 덮어쓰지 않고, 없는 것만 채워 넣는다"는 정반대 전략을 쓴다.
 install_content_files() {
     source_root=/usr/src/wordpress/wp-content
     target_root="${wordpress_dir}/wp-content"
@@ -157,6 +179,8 @@ install_content_files() {
 }
 
 publish_config_link() {
+    # [INTV:EDGE] 심볼릭 링크 자체도 임시 이름으로 만든 뒤 mv로 원자적으로 교체 — wp-config.php 경로가
+    # "링크가 없는 상태"에서 "잘못된 대상을 가리키는 상태"로 잠깐이라도 노출되는 걸 피한다.
     temporary="${wordpress_dir}/.wp-config-link.$$"
     rm -f -- "$temporary"
     ln -s "$config_path" "$temporary"
@@ -164,6 +188,13 @@ publish_config_link() {
     sync -f "$wordpress_dir"
 }
 
+# [INTV:ARCH] 아키텍처 핵심: wp-config.php의 실제 내용은 웹 루트(wordpress_dir)가 아니라 별도 볼륨
+# (config_dir)에 저장하고, 웹 루트에는 그곳을 가리키는 심볼릭 링크만 둔다. wordpress_dir는 nginx에도
+# 읽기 전용으로 마운트되는 공유 볼륨이라, DB 비밀번호와 인증 salt가 담긴 실제 설정 파일을 그 안에 직접
+# 두면 유출 표면이 넓어지기 때문이다.
+# - [TRAP] 이 함수는 과거 버전(링크 없이 파일을 직접 두던 방식)과의 마이그레이션 호환까지 함께
+#   처리한다 — 재구현 시 "이미 심볼릭 링크인 경우"만 다루고 "예전 레이아웃의 일반 파일이 남아있는
+#   경우"를 놓치면, 기존 배포를 업그레이드할 때 설정이 유실되거나 두 곳의 내용이 갈라질 수 있다.
 prepare_config_location() {
     install -d -m 0700 -o www-data -g www-data "$config_dir"
     if [ -L "$config_link" ]; then
@@ -177,6 +208,8 @@ prepare_config_location() {
     fi
 
     if [ -e "$config_link" ]; then
+        # 링크가 아니라 실제 파일이 웹 루트에 남아있는 경우 — 예전 레이아웃에서 마이그레이션하는 경로.
+        # 새 위치(config_path)로 옮겨두고 원래 자리는 링크로 대체한다.
         [ -f "$config_link" ] \
             || fail "WordPress configuration path is not a regular file"
         if [ -e "$config_path" ]; then
@@ -208,6 +241,9 @@ prepare_config_location() {
 write_wordpress_config() {
     target="$config_path"
     temporary="${config_dir}/.wp-config.bootstrap.$$"
+    # [INTV:PERF] /dev/urandom에서 128바이트를 한 번 읽어 16진수 문자열로 바꾼 뒤, 접미사(01~08)만
+    # 바꿔가며 8개의 서로 다른 인증 salt 값으로 잘라 쓴다 — 난수 소스를 여덟 번 따로 읽는 대신 한 번의
+    # 읽기로 충분히 긴 값을 얻어 값마다 구분자를 붙이는 방식.
     salts="$(od -An -N128 -tx1 /dev/urandom | tr -d ' \n')"
     (
         umask 077
@@ -252,6 +288,9 @@ config_value() {
     wp config get "$name" --allow-root --path="$wordpress_dir" --type="$kind" 2>/dev/null
 }
 
+# [INTV:ARCH] 반환값에 세 가지 뜻을 담는 작은 상태 코드 — 아래 converge_wordpress_config()의 case
+# 문에서 그대로 분기 근거로 쓰인다: 0 = 설정이 존재하고 지금 넘어온 값들과 일치, 1 = 설정 자체가 없음
+# (처음 부트스트랩), 2 = 설정은 있지만 값이 다름(충돌).
 validate_wordpress_config() {
     target="$config_path"
     [ -L "$config_link" ] || return 1
@@ -270,8 +309,16 @@ validate_wordpress_config() {
     [ "$actual_db_host" = "$WORDPRESS_DB_HOST" ] || return 2
 }
 
+# [INTV:ARCH] WORDPRESS_URL(도메인)이 바뀌면 이미 부트스트랩이 끝난 사이트라도 매번 WP_HOME/
+# WP_SITEURL을 최신값으로 맞춰야 하므로, 이 함수는 converge_wordpress_config()에서 분기와 무관하게
+# 항상 호출된다. wp-cli 대신 직접 만든 작은 PHP 스크립트로 처리하는 이유는 파일을 원자적으로
+# 교체(rename)하는 절차까지 이 스크립트 하나에서 함께 제어하기 위함이다.
 update_config_urls() {
     updater=/run/container-stack-update-config.php
+    # [INTV:TRAP] <<'PHP' — 구분자를 따옴표로 감싼 heredoc은 안의 $변수를 셸이 치환하지 않고 그대로
+    # 파일에 쓴다(앞서 mariadb entrypoint의 따옴표 없는 <<SQL과 반대). PHP 자체 변수($path 등)를 셸이
+    # 건드리면 안 되므로 필수 — 따옴표를 빼먹으면 PHP 소스 안의 $path, $url 등이 셸에 의해 먼저
+    # (대개 빈 문자열로) 치환되어버려 완전히 다른 스크립트가 파일에 쓰인다.
     cat >"$updater" <<'PHP'
 <?php
 $path = getenv('CONTAINER_STACK_CONFIG_PATH');
@@ -346,6 +393,8 @@ converge_wordpress_config() {
         0)
             ;;
         1)
+            # [INTV:EDGE] 마커가 이미 있다는 건 "예전에 부트스트랩이 끝났다"는 뜻인데 설정이 없다면
+            # 정상 상태가 아니므로, 새로 만들지 않고 실패시켜 조용히 새 설정으로 갈아치우는 사고를 막는다.
             if [ -f "$marker" ]; then
                 fail "completed WordPress configuration is invalid"
             fi
@@ -373,6 +422,8 @@ install_wordpress() {
     fi
     command_log="$(mktemp /run/wp-core-install.XXXXXX)"
     chmod 0600 "$command_log"
+    # [INTV:EDGE] --prompt=admin_password로 값을 표준입력에서 받는다 — mariadb entrypoint와 같은
+    # 이유로, 비밀번호를 커맨드라인 인자로 남기지 않기 위함.
     if ! printf '%s\n' "$admin_password" \
         | wp core install --allow-root --path="$wordpress_dir" \
             --url="$WORDPRESS_URL" \
@@ -403,6 +454,9 @@ ensure_author() {
     rm -f -- "$command_log"
 }
 
+# [INTV:EDGE] 계정을 "만들었다"는 것과 "지정한 비밀번호로 실제 로그인 가능하다"는 것은 다른 문제라,
+# wp-cli의 내부 검증 함수인 wp_check_password()를 워드프레스 실행 컨텍스트 안에서 직접 돌려 확인한다.
+# 이 역시 후보 비밀번호를 커맨드라인이 아니라 stdin으로 넘긴다.
 verify_user_password() {
     login="$1"
     password="$2"
@@ -455,6 +509,8 @@ bootstrap() {
     require_name WORDPRESS_USER "$WORDPRESS_USER"
     require_runtime_value WORDPRESS_DB_HOST "$WORDPRESS_DB_HOST"
     require_runtime_value WORDPRESS_URL "$WORDPRESS_URL"
+    # [INTV:EDGE] 이 스택은 TLS만 서빙하므로(nginx.conf에 80 포트가 없음), 사이트 URL도 https로
+    # 강제해서 워드프레스가 내부적으로 http:// 링크를 생성하는 불일치를 원천 차단한다.
     case "$WORDPRESS_URL" in
         https://*) ;;
         *) fail "WORDPRESS_URL must use https" ;;
@@ -462,6 +518,8 @@ bootstrap() {
     require_positive_integer WORDPRESS_DB_WAIT_RETRIES "$wait_retries"
     require_positive_integer WORDPRESS_DB_WAIT_DELAY "$wait_delay"
 
+    # mariadb entrypoint와 같은 이유로 세 비밀번호(DB/관리자/작성자)를 환경변수가 아니라 표준입력
+    # 3줄로 받는다.
     IFS= read -r db_password || fail "missing database password on standard input"
     IFS= read -r admin_password || fail "missing administrator password on standard input"
     IFS= read -r user_password || fail "missing author password on standard input"

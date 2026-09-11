@@ -1,6 +1,14 @@
 #!/usr/bin/env python3
 """실행 중인 스택의 DB·WordPress 자격증명을 검증 가능한 절차로 회전합니다."""
 
+# [INTV:ARCH] Saga 패턴: "비밀값 회전"은 다섯 군데(호스트의 비밀 파일 4개, MariaDB root 계정, MariaDB
+# 애플리케이션 계정, wp-config.php의 DB 비밀번호, WordPress 관리자·작성자 계정 비밀번호)를 스택을 내리지
+# 않고 순서대로 갈아치우는 분산 트랜잭션이다. 하나의 원자적 커밋이 불가능한 여러 시스템에 걸친 변경이라,
+# 각 단계마다 실패를 흉내 낼 수 있는 테스트 훅(FAILURE_STAGES/maybe_fail)과, 실패 시 역순으로 이전
+# 값으로 되돌리는 보상 트랜잭션(rollback_rotation())을 함께 갖추고 있다.
+# - [TRAP] 재구현 시 "성공 아니면 전부 실패"라는 단일 트랜잭션 사고방식으로 접근하면 안 된다. 다섯
+#   시스템 중 일부만 바뀐 중간 상태가 실제로 존재할 수 있다는 전제로, 각 단계·롤백 모두 멱등하거나
+#   최소한 재시도 가능하게 설계해야 한다.
 from __future__ import annotations
 
 import argparse
@@ -34,6 +42,10 @@ SECRET_FILES = {
 }
 PASSWORD_PATTERN = re.compile(r"^[A-Za-z0-9_.~!@#%^+=,-]{24,128}$")
 NAME_PATTERN = re.compile(r"^[A-Za-z0-9_]{1,64}$")
+# [INTV:ARCH] 이 이름들은 아래 _rotate()가 진행하는 실제 절차의 각 단계와 1:1로 대응한다 — CLI의
+# --fail-after에 이 중 하나를 지정하면 그 단계 "직후"에 인위적으로 실패를 일으켜, 회전이 정확히 그
+# 시점에서 죽었을 때도 rollback_rotation()이 이전 상태로 되돌릴 수 있는지를 검증할 수 있다(테스트
+# 전용, --help에는 숨김 — argparse.SUPPRESS 참고).
 FAILURE_STAGES = (
     "admin-user-command",
     "users",
@@ -59,6 +71,11 @@ class RotationError(RuntimeError):
 
 
 def read_secret(path: Path, *, require_owner: bool) -> str:
+    # [INTV:EDGE] stack_runtime.py의 read_private_secret()과 같은 방어 기법(O_NOFOLLOW/O_NONBLOCK로
+    # 심볼릭 링크·특수 파일 회피, fstat으로 "연 디스크립터 자체"를 검사, 1바이트 더 읽어 크기 제한
+    # 확인) — 여기서는 소유자 검사를 require_owner로 켜고 끌 수 있게만 다르다.
+    # - [TRAP] os.stat(path)처럼 경로로 다시 검사하면 open()과 stat() 사이에 파일이 교체되는
+    #   TOCTOU(time-of-check to time-of-use) 레이스가 생긴다. 반드시 이미 연 디스크립터를 fstat할 것.
     try:
         descriptor = os.open(path, os.O_RDONLY | NOFOLLOW | NONBLOCK)
     except OSError as error:
@@ -87,6 +104,10 @@ def read_secret(path: Path, *, require_owner: bool) -> str:
 
 
 def atomic_secret_write(path: Path, value: str) -> None:
+    # [INTV:EDGE] 최종 목적지(path)와 "같은 디렉터리"에 임시 파일을 만든다 — 그래야 os.replace가
+    # 파일시스템 경계를 넘지 않는 rename이 되어 원자적으로 처리된다(디렉터리가 다르면 복사+삭제로
+    # 풀릴 수 있어 원자성이 깨진다). entrypoint 셸 스크립트들의 "같은 디렉터리에 임시 파일 -> mv"
+    # 패턴을 파이썬으로 재현한 것.
     descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
     temporary = Path(temporary_name)
     try:
@@ -96,13 +117,22 @@ def atomic_secret_write(path: Path, value: str) -> None:
             stream.write("\n")
             stream.flush()
             os.fsync(stream.fileno())
+        # [INTV:TRAP] os.replace: 목적지가 이미 존재해도 그 자리에서 원자적으로 덮어쓴다(os.rename은
+        # 플랫폼에 따라 기존 파일이 있으면 실패할 수 있어 이 용도엔 os.replace를 써야 한다).
         os.replace(temporary, path)
+        # [INTV:EDGE] 파일 내용을 fsync한 것과 별개로, "이 이름이 이 파일을 가리킨다"는 디렉터리
+        # 항목 자체도 디스크에 반영돼야 한다 — 디렉터리를 열어 그 디스크립터를 fsync하는 것이 그
+        # 방법이다 (entrypoint 스크립트들의 `sync -f`와 같은 목적을 os 모듈로 수행).
+        # - [TRAP] 파일 fsync만 하고 디렉터리 fsync를 빼먹으면, rename 자체는 됐지만 그 사실을 담은
+        #   디렉터리 엔트리가 아직 디스크에 안 쓰인 상태에서 정전이 나 rename이 유실될 수 있다.
         directory = os.open(path.parent, os.O_RDONLY | DIRECTORY | NOFOLLOW)
         try:
             os.fsync(directory)
         finally:
             os.close(directory)
     finally:
+        # 정상 경로라면 os.replace가 이미 temporary를 옮겨버려 존재하지 않는다 — 여기 도달하는 건
+        # 그 전에 예외가 나 임시 파일이 아직 남아있는 실패 경로일 때뿐.
         if temporary.exists():
             temporary.unlink()
 
@@ -147,6 +177,11 @@ def service_environment(config: dict[str, object], service: str) -> dict[str, st
 
 
 def sql_literal(value: str) -> str:
+    # [INTV:EDGE] SQL 문자열 리터럴 이스케이프: 작은따옴표를 두 개로 이어붙이는 표준 방식으로 값 안의
+    # '가 문자열 경계를 깨고 나가지 못하게 막는다. 파라미터 바인딩이 아니라 SQL 텍스트를 직접 조립해야
+    # 하는 상황(아래 root_sql이 mariadb CLI로 원문 SQL을 그대로 흘려보냄)이라 수동 이스케이프가 필요하다.
+    # - [TRAP] 비밀번호 후보 문자 집합에 '가 포함되어 있어(PASSWORD_PATTERN 참고) 이 이스케이프를
+    #   빼먹으면 비밀번호 값 자체로 SQL 인젝션이 가능해진다.
     return "'" + value.replace("'", "''") + "'"
 
 
@@ -157,6 +192,14 @@ def root_sql(
     *,
     check: bool = True,
 ) -> subprocess.CompletedProcess[bytes]:
+    # [INTV:ARCH] 표준입력 하나에 "비밀번호 한 줄 + 그 뒤로 이어지는 SQL 원문"을 함께 실어 보낸다.
+    # 컨테이너 안 셸은 `IFS= read -r password`로 첫 줄(비밀번호)만 소비해 옵션 파일을 만들고, 그 뒤
+    # 남은 표준입력은 셸이 건드리지 않은 채 마지막 명령인 mariadb로 그대로 흘러들어가 mariadb가 그것을
+    # 비대화형 SQL 입력으로 실행한다 — 파이프 하나로 두 프로그램에 각자 다른 데이터를 넘기는 방식.
+    # [INTV:EDGE] 옵션 파일(--defaults-extra-file)에 비밀번호를 적어 넘기는 이유는 entrypoint
+    # 스크립트와 동일 — 커맨드라인 인자(`ps`로 노출됨)에 비밀번호가 남지 않게 하기 위함.
+    # - [TRAP] 이 구조를 재구현하며 read 순서를 헷갈리면(예: SQL을 먼저 보냄), 셸이 SQL 텍스트의 첫
+    #   줄을 비밀번호로 오인해 옵션 파일에 SQL 구문 조각을 적어 넣는 조용한 실패가 생긴다.
     payload = root_password.encode() + b"\n" + sql.encode() + b"\n"
     return project.run(
         "exec",
@@ -176,6 +219,11 @@ def root_sql(
     )
 
 
+# [INTV:ARCH] 아래 네 PHP_* 상수는 `php -r <코드>`로 wordpress 컨테이너 안에서 그대로 실행되는 짧은
+# PHP 스크립트다. 셸이 아니라 PHP를 쓰는 이유는 wp-config.php 수정이나 WordPress 내부 함수
+# (wp_set_password 등) 호출이 WordPress 코드베이스(PHP) 안에서만 가능하기 때문이다.
+# [INTV:EDGE] 모두 stream_get_contents(STDIN)으로 JSON 페이로드를 표준입력으로 받는다 — 값(특히
+# 비밀번호)을 `-r` 코드 문자열이나 커맨드라인 인자에 직접 박아 넣지 않기 위함.
 PHP_CONFIG = r"""
 $payload = json_decode(stream_get_contents(STDIN), true, 8, JSON_THROW_ON_ERROR);
 $path = '/var/www/config/wp-config.php';
@@ -212,6 +260,11 @@ try {
 }
 if (!empty($payload['fail_after_write'])) { fwrite(STDERR, "injected post-write failure\n"); exit(9); }
 """
+# [INTV:TRAP] 위 realpath 비교: PHP의 tempnam()은 지정한 디렉터리에 쓸 수 없으면 조용히 시스템 임시
+# 디렉터리로 대신 만들어버릴 수 있다 — 그렇게 되면 뒤이은 rename이 더 이상 원자적 교체가 아니게
+# 되므로, 실제로 같은 디렉터리에 만들어졌는지를 먼저 확인해 그 함정을 걸러낸다.
+# [INTV:ARCH] fail_after_write/exit(9): 파일 교체가 "이미 커밋된 뒤" 실패를 일으키는 테스트 훅 —
+# 롤백 로직이 "일부는 이미 반영됐고 이후 단계만 실패한" 상황도 올바르게 복구하는지 검증하기 위함.
 
 
 PHP_USER = r"""
@@ -236,6 +289,8 @@ clean_user_cache(get_user_by('login', $login)->ID);
 $account = get_user_by('login', $login);
 if (!$account || !wp_check_password($payload['password'], $account->user_pass, $account->ID)) { exit(1); }
 """
+# [INTV:ARCH] wp_check_password는 wordpress entrypoint의 verify_user_password()가 부트스트랩 직후
+# 검증할 때 쓰는 것과 같은 WordPress 내장 함수 — 저장된 해시와 평문 비밀번호를 비교해준다.
 
 
 PHP_PROBE_CONFIG = r"""
@@ -256,6 +311,10 @@ def wordpress_php(
     one_off: bool = False,
 ) -> subprocess.CompletedProcess[bytes]:
     if one_off:
+        # [INTV:ARCH] 롤백 도중에는 wordpress 서비스 컨테이너 자체가 이미 강제 재생성되었거나 제거됐을
+        # 수 있어(아래 rollback_rotation/_rotate 참고), 살아있는 서비스에 exec하는 대신 같은 이미지로
+        # 1회성 컨테이너를 새로 띄워 PHP 코드만 실행한다 — 공유 볼륨(wp-config, wp-content)은 특정
+        # 컨테이너 인스턴스가 아니라 볼륨 자체에 있으므로 이 방식으로도 같은 상태를 다룰 수 있다.
         arguments = (
             "run",
             "--rm",
@@ -321,6 +380,9 @@ def alter_database_passwords(
     new_root_password: str | None = None,
     fail_after_write: bool = False,
 ) -> None:
+    # [INTV:PERF] [INTV:EDGE] 두 계정(app/root)의 비밀번호 변경을 한 SQL 배치(세미콜론으로 이어붙인
+    # 여러 문장)로 묶어 한 번의 접속으로 실행한다 — 두 번의 별도 exec 호출 사이에 한쪽만 바뀐 상태가
+    # 노출되는 창(window)을 줄인다.
     statements = ["SET SESSION sql_mode='NO_BACKSLASH_ESCAPES'", "FLUSH PRIVILEGES"]
     if app_password is not None:
         statements.append(
@@ -332,6 +394,8 @@ def alter_database_passwords(
         )
     statements.append("FLUSH PRIVILEGES")
     if fail_after_write:
+        # [INTV:ARCH] SIGNAL: MariaDB/MySQL이 SQL 배치 도중 사용자 정의 에러를 강제로 일으키는 구문 —
+        # 앞선 ALTER 문들은 이미 커밋된 뒤에 이 배치 자체는 실패로 보고되게 만드는 테스트 훅.
         statements.append(
             "SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT='injected rotation failure'"
         )
@@ -339,6 +403,8 @@ def alter_database_passwords(
 
 
 def maybe_fail(stage: str | None, current: str) -> None:
+    # FAILURE_STAGES에 대응하는 실제 발동 지점 — 요청된 실패 단계 이름이 지금 막 끝낸 단계 이름과
+    # 같으면 그 자리에서 실패를 발생시킨다.
     if stage == current:
         raise RotationError(f"실패 주입: {current}")
 
@@ -347,6 +413,8 @@ def publish_test_marker(path: Path, value: str) -> Path:
     marker = path.expanduser()
     if not marker.is_absolute():
         marker = Path.cwd() / marker
+    # [INTV:EDGE] O_EXCL: 파일이 이미 존재하면 실패 — 이전 실행이 남긴 낡은 준비 파일을 새 것으로
+    # 착각하지 않게 막는다.
     descriptor = os.open(
         marker,
         os.O_WRONLY | os.O_CREAT | os.O_EXCL | NOFOLLOW,
@@ -367,6 +435,9 @@ def app_sql(
     *,
     check: bool = True,
 ) -> subprocess.CompletedProcess[bytes]:
+    # [INTV:ARCH] root_sql과 같은 보안 패턴(비밀번호를 옵션 파일로)이지만, 이번엔 mariadb가 아니라
+    # wordpress 컨테이너 "안에서" mariadb 서비스로 접속을 시도한다 — 자격증명 자체의 유효성만이 아니라
+    # 워드프레스가 실제로 쓰는 것과 같은 네트워크 경로(-hmariadb)로도 인증이 되는지까지 확인하기 위함.
     payload = password.encode() + b"\n"
     return project.run(
         "exec",
@@ -417,6 +488,16 @@ def wordpress_config_matches(project: ComposeProject, password: str) -> bool:
 def verify_runtime_secret_boundary(
     project: ComposeProject, secrets: dict[str, str]
 ) -> None:
+    # [INTV:ARCH] 심층 방어(defense in depth) 검증: "설정상 그렇게 되어 있어야 한다"가 아니라 "실제로
+    # 떠 있는 컨테이너가 정말 그런 상태인지"를 docker inspect/top으로 직접 확인한다 — Compose 파일의
+    # 의도가 런타임에도 실제로 지켜지는지 검증하는 마지막 방어선.
+    # - [FLOW] 확인 항목: 1. 예전 방식(/run/secrets 마운트)이 어디에도 없는지 -> 2. nginx가
+    #   wp-config.php 관련 볼륨/경로를 전혀 볼 수 없는지 -> 3. 컨테이너에 선언된 환경변수 "이름" 중
+    #   비밀번호 계열이 없는지 -> 4. 컨테이너 안 모든 프로세스의 /proc/*/environ에도 없는지 ->
+    #   5. 모든 프로세스의 커맨드라인 인자(docker top)에도 실제 비밀 "값"이 노출되지 않았는지
+    # - [TRAP] 5번 항목을 빼먹으면, root_sql/app_sql이 비밀번호를 인자 대신 임시 옵션 파일로 넘기는
+    #   설계(구현 의도)가 실제로 지켜지는지 아무도 검증하지 않는 셈이 된다 — "이름"만 검사하고 "값"
+    #   노출은 검사하지 않는 게 이 패턴에서 가장 흔히 빠지는 구멍이다.
     forbidden_names = (
         "MYSQL_ROOT_PASSWORD",
         "MYSQL_PASSWORD",
@@ -509,6 +590,9 @@ def verify_runtime_secret_boundary(
             timeout=QUERY_TIMEOUT_SECONDS,
         ).stdout
     for value in secrets.values():
+        # [INTV:EDGE] 지금까지 모아온 모든 텍스트(환경변수·프로세스 인자 등)를 대상으로, 실제 비밀
+        # "값"이 글자 그대로 한 번이라도 등장하는지 마지막으로 검사 — 이름이 아니라 값 자체가 새어
+        # 나갔는지 확인하는 최종 관문.
         if value and value in observed:
             raise RotationError("런타임 환경이나 프로세스 인자에 비밀값이 남았습니다")
 
@@ -519,6 +603,11 @@ def verify_rotation(
     secrets: dict[str, str],
     rejected: dict[str, str] | None = None,
 ) -> None:
+    # [INTV:EDGE] secrets가 "지금 유효해야 하는" 값들의 전체 기능 검증(경계 확인 + DB 로그인 +
+    # wp-config 일치 + WP 계정 비밀번호 일치). rejected가 주어지면 그 반대도 함께 확인한다.
+    # - [TRAP] 새 비밀번호가 통과하는 것만 확인하고 옛 비밀번호가 "거부"되는지를 확인하지 않으면,
+    #   "새 비밀번호도 되고 옛 비밀번호도 여전히 되는"(즉 회전이 실제로는 실패한) 상태를 성공으로
+    #   오판할 수 있다.
     boundary_values = dict(secrets)
     if rejected is not None:
         boundary_values.update(
@@ -559,6 +648,8 @@ def find_root_password(
     project: ComposeProject,
     candidates: tuple[str, ...],
 ) -> str | None:
+    # [INTV:EDGE] 롤백 시점에는 root 비밀번호 변경이 이미 반영됐는지 아직 안 됐는지 알 수 없다 —
+    # 새 비밀번호와 이전 비밀번호를 순서대로 시도해 "지금 실제로 통하는" 쪽을 찾아낸다.
     attempted: set[str] = set()
     for candidate in candidates:
         if candidate in attempted:
@@ -576,6 +667,11 @@ def rollback_rotation(
     replacement: dict[str, str],
     database_user: str,
 ) -> tuple[list[str], bool]:
+    # [INTV:ARCH] Saga 보상 트랜잭션: 다섯 시스템을 역순으로 되돌리는 최선 노력(best-effort) 복구 —
+    # 한 단계가 실패해도 errors에 기록만 하고 나머지 단계는 계속 시도한다.
+    # - [TRAP] 첫 실패에서 즉시 중단하도록 재구현하면, 오히려 "일부만 되돌려진" 더 나쁜 상태로 끝날
+    #   수 있다. 가능한 한 모든 단계를 시도한 뒤 마지막에 실제로 복구됐는지 재검증(verify_rotation)
+    #   하는 순서를 지킬 것 — 개별 단계의 성공 여부가 아니라 최종 상태가 진짜 판정 기준이다.
     errors: list[str] = []
     result = project.run(
         "up",
@@ -697,6 +793,12 @@ def _rotate(
 
     mariadb_environment = service_environment(config, "mariadb")
     database_user = mariadb_environment.get("MYSQL_USER", "")
+    # [INTV:EDGE] database_user는 뒤에서 app_sql()이 이스케이프 없이 셸 명령 문자열에
+    # f"-u{database_user}"로 직접 끼워 넣는다 — 이 정규식 검증이 그 자리의 유일한 방어선이므로,
+    # sql_literal 같은 사후 이스케이프 대신 "허용 문자 집합 자체를 제한"하는 입력 검증(allowlist)을 쓴다.
+    # - [TRAP] 이 정규식 검증을 빼먹고 database_user를 셸 문자열에 그대로 끼워 넣으면, Compose 설정의
+    #   MYSQL_USER 값을 통한 셸 인젝션이 가능해진다 — 신뢰 경계를 넘는 값은 조립 지점이 아니라
+    #   진입 지점에서 검증해야 한다는 원칙.
     if not NAME_PATTERN.fullmatch(database_user):
         raise RotationError("MYSQL_USER 형식이 안전하지 않습니다")
     wordpress_environment = service_environment(config, "wordpress")
@@ -705,7 +807,13 @@ def _rotate(
     if not admin_user or not regular_user or admin_user == regular_user:
         raise RotationError("WordPress 관리자와 일반 사용자는 서로 다른 계정이어야 합니다")
 
+    # [INTV:EDGE] 아무것도 바꾸기 전에 "현재 상태가 정말 예상과 같은지"부터 검증 — 비밀 파일과 실제
+    # 서비스 상태가 이미 어긋나 있다면 회전을 시작하지 않고 여기서 멈춘다 (사전 조건 검증).
     verify_rotation(project, database_user, current, replacement)
+    # [INTV:ARCH] blocked: nginx를 내렸다가 다시 올려야 하는 책임이 아직 안 끝났는지 추적하는 플래그.
+    # - [TRAP] 정상 경로 끝, 또는 실패 후 롤백 성공 시에만 False로 바뀐다는 조건을 놓치고 재구현하면,
+    #   예외가 나는 경로 중 일부에서 nginx가 영영 내려간 채로 남을 수 있다. finally에서 "그 외의 모든
+    #   경우"에 nginx를 다시 올리는 게 핵심(이미 살아있어도 --detach만으로는 문제 없다).
     blocked = False
     try:
         blocked = True
@@ -758,6 +866,11 @@ def _rotate(
             if read_secret(path, require_owner=True) != replacement[name]:
                 raise RotationError(f"호스트 비밀 파일 회전 검증 실패: {path.name}")
         blocked = False
+    # [INTV:EDGE] Exception이 아니라 BaseException을 잡는다 — Ctrl+C(KeyboardInterrupt), SystemExit
+    # 등 보통은 그냥 전파시킬 신호성 예외까지도, 다섯 시스템 중 일부만 바뀐 채로 방치하지 않기 위해
+    # 반드시 롤백 절차로 흘려보낸다.
+    # - [TRAP] 여기서 Exception만 잡도록 재구현하면, 회전 도중 사용자가 Ctrl+C를 누르는 순간
+    #   KeyboardInterrupt가 이 except를 우회해 그대로 위로 전파되어 롤백이 전혀 실행되지 않는다.
     except BaseException as original_error:
         signal_state["rollback_active"] = True
         marker: Path | None = None
@@ -798,6 +911,14 @@ def rotate(
     previous_handlers: dict[signal.Signals, object] = {}
     signal_state = {"rollback_active": False, "deferred": False}
 
+    # [INTV:ARCH] signal_state는 이 클로저(interrupt)와 바깥의 _rotate()가 함께 들여다보고 갱신하는
+    # 공유 딕셔너리 — 딕셔너리 "내용물"을 바꾸는 것이라 파이썬의 nonlocal 선언 없이도 중첩 함수에서
+    # 자유롭게 값을 읽고 쓸 수 있다 (가변 객체를 통한 클로저 상태 공유).
+    # [INTV:EDGE] 롤백이 이미 시작된 뒤에 또 신호가 오면 즉시 중단시키지 않고 "나중에 알려줄 사실"로만
+    # 기록해 두어, 복구 절차 자체가 중간에 끊기지 않게 한다.
+    # - [TRAP] rollback_active 체크 없이 매번 즉시 raise하도록 재구현하면, 롤백 도중 사용자가 다시
+    #   Ctrl+C를 누르는 순간 보상 트랜잭션 자체가 중단되어 다섯 시스템이 뒤섞인 상태로 영구히 남을
+    #   위험이 있다.
     def interrupt(signum: int, _frame: object) -> None:
         if signal_state["rollback_active"]:
             signal_state["deferred"] = True
@@ -805,6 +926,10 @@ def rotate(
         signal_name = signal.Signals(signum).name
         raise RotationError(f"{signal_name} 신호로 회전이 중단되었습니다")
 
+    # [INTV:EDGE] signal.signal()은 이전에 등록돼 있던 핸들러를 반환한다 — 그 값을 저장해 두었다가
+    # finally에서 원래대로 복원해, 이 함수가 끝난 뒤에는 평소의 신호 처리로 돌아가게 한다.
+    # - [TRAP] 복원을 빼먹으면 회전 함수 호출이 끝난 뒤에도 이 프로세스 전역의 SIGINT/SIGTERM 핸들러가
+    #   바뀐 채로 남아, 이후 코드의 Ctrl+C 동작이 예상과 달라지는 전역 부작용이 생긴다.
     for current_signal in (signal.SIGINT, signal.SIGTERM):
         previous_handlers[current_signal] = signal.signal(current_signal, interrupt)
     try:
@@ -842,6 +967,8 @@ def main() -> int:
         print("docker 명령을 찾을 수 없습니다", file=sys.stderr)
         return 2
     try:
+        # [INTV:TRAP] "(a is None) != (b is None)": 불리언 두 개를 !=로 비교하면 배타적 논리합(XOR)처럼
+        # 동작한다 — 둘 중 정확히 하나만 None일 때(즉 하나만 지정됐을 때) 참이 되어 에러로 처리.
         if (args.pause_after is None) != (args.pause_ready_file is None):
             raise RotationError("일시정지 단계와 준비 파일을 함께 지정해야 합니다")
         if args.rollback_ready_file is not None and args.pause_after is None:

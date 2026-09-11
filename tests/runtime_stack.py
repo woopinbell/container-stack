@@ -1,6 +1,15 @@
 #!/usr/bin/env python3
 """격리된 Compose 프로젝트에서 컨테이너 스택의 실제 동작을 검사합니다."""
 
+# tests/validate_stack.py가 "소스 코드가 그렇게 생겼는지"만 보는 정적 검사라면, 이 파일은 실제로
+# 이미지를 빌드하고 컨테이너를 띄워 동작을 검사하는 런타임 시나리오다. RuntimeStack 하나가
+# 완전히 격리된 Compose 프로젝트 하나(고유한 프로젝트 이름·포트·비밀 파일·.env)를 표현하고,
+# tools/*.py를 라이브러리로 import해서 함수를 직접 부르는 대신 실제 사용자처럼 `python3 tools/xxx.py`를
+# 서브프로세스로 실행해 검사한다 — CLI 인터페이스 자체가 문서화된 대로 동작하는지까지 확인하는
+# 블랙박스 통합 테스트를 지향하는 설계다. 시나리오는 6가지(main() 하단 참고): bootstrap(부트스트랩
+# 도중 강제종료 후 복구), e2e(정상 경로 종단 검증), persistence(재기동 뒤 데이터 보존),
+# backup-restore(백업/복원과 그 실패·중단 처리), rotation(비밀값 회전과 롤백), operations(리소스 제한·
+# 네트워크 격리·진단 도구 등 운영 기능)
 from __future__ import annotations
 
 import argparse
@@ -43,11 +52,18 @@ def require_command(name: str) -> None:
 
 
 def reserve_port() -> int:
+    # 포트 0으로 바인드하면 커널이 현재 비어있는 임시 포트를 하나 골라준다 — 여러 시나리오를
+    # 동시에 돌려도 서로 다른 HTTPS 포트를 쓰게 되어 충돌하지 않는다(다만 소켓을 곧바로 닫으므로
+    # 그 사이 다른 프로세스가 같은 포트를 채갈 여지는 남는다 — 아래 start()의 재시도 로직이 그 경우를 처리)
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
         listener.bind(("127.0.0.1", 0))
         return int(listener.getsockname()[1])
 
 
+# write_private/replace_private: tools/stack_runtime.py, tools/rotate_secrets.py에서 이미 설명한 것과 같은
+# "0600 권한으로 새로 만들기" / "임시 파일에 쓰고 원자적으로 교체하기" 패턴을 테스트 코드 쪽에서
+# 독립적으로 재구현한 것 — 테스트가 만드는 가짜 비밀 파일·.env도 운영 코드가 기대하는 것과 같은
+# 권한 모델을 지켜야 검증이 의미가 있기 때문
 def write_private(path: Path, value: str) -> None:
     descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
@@ -89,6 +105,9 @@ class RuntimeStack:
         self.project_record_dir = project_record_dir
         self.temp = Path(tempfile.mkdtemp(prefix="container-stack-e2e-"))
         self.temp.chmod(0o700)
+        # 이 이름 형식(container-stack-<PID>-<임의 hex 6자>)은 tools/cleanup_test_resources.py의
+        # PROJECT_PATTERN 정규식과 정확히 맞아떨어져야 한다 — 검증이 비정상 종료해 자원을 못 지워도,
+        # 그 도구가 나중에 "이건 테스트가 만든 프로젝트다"라고 식별해 회수할 수 있게 하기 위함
         self.project = f"container-stack-{os.getpid()}-{secrets.token_hex(3)}"
         self.domain = "stack.test"
         self.port = reserve_port()
@@ -110,6 +129,9 @@ class RuntimeStack:
             raise
 
     def _record_project(self) -> None:
+        # tools/verify_stack.py가 넘겨주는 기록 디렉터리에 프로젝트 이름을 파일 하나로 남겨둔다 —
+        # 이 시나리오가 도중에 죽어 자기 손으로 자원을 못 치워도, 그 디렉터리를 근거로
+        # cleanup_test_resources.py가 정확히 이 프로젝트만 찾아 정리할 수 있게 하는 안전망
         if self.project_record_dir is None:
             return
         directory = self.project_record_dir
@@ -162,6 +184,9 @@ class RuntimeStack:
         )
         self._write_environment()
 
+    # compose_command/run_compose는 tools/stack_runtime.py의 ComposeProject와 거의 같은 모양이지만
+    # 일부러 그걸 import하지 않고 독자적으로 다시 구현했다 — 이 테스트가 운영 도구의 "내부 구현"이 아니라
+    # "명령행 동작"을 검증 대상으로 삼기 때문에, 검증 코드 자체가 그 구현에 의존하지 않게 분리해 둔 것
     def compose_command(self, *arguments: str) -> list[str]:
         return [
             "docker",
@@ -251,6 +276,9 @@ class RuntimeStack:
 
     def start(self) -> None:
         self.started = True
+        # reserve_port()로 고른 포트가 실제 docker compose up 시점에는 이미 다른 프로세스가 차지했을 수
+        # 있다(예약과 사용 사이의 경합) — 에러 메시지에 "포트가 이미 쓰이는 중" 계열 문구가 있을 때만
+        # 새 포트를 골라 재시도하고, 그 외의 실패는 재시도 없이 바로 올려서 진짜 버그를 감추지 않는다
         for attempt in range(PORT_RETRY_LIMIT):
             result = self._run_start("start", build=True, check=False)
             if result.returncode == 0:
@@ -327,6 +355,11 @@ class RuntimeStack:
                 f"관리 작업 뒤 서비스가 모두 복구되지 않았습니다: {sorted(running)}"
             )
 
+    # tools/rotate_secrets.py의 verify_runtime_secret_boundary()와 같은 항목(예전 시크릿 마운트 부재,
+    # nginx에서 wp-config 격리, 컨테이너 선언 환경변수·프로세스 환경·프로세스 인자에 비밀 이름/값 부재)을
+    # 이 테스트 하네스 나름대로 다시 구현한 것 — 회전 시나리오뿐 아니라 e2e·bootstrap 등 다른 모든
+    # 시나리오에서도 재사용하기 위함. 추가로 wp-config.php "내용"까지 직접 읽어 DB 비밀번호는 있어야 하고
+    # 나머지 비밀값은 없어야 함을 확인하고, `docker compose logs` 전체에도 비밀값이 없는지까지 검사한다
     def assert_runtime_secret_boundary(
         self, expected_values: dict[str, str] | None = None
     ) -> None:
@@ -459,6 +492,10 @@ class RuntimeStack:
         return inspected[0]
 
     def fetch(self, path: str) -> str:
+        # self.domain("stack.test")은 실제 DNS에 등록된 도메인이 아니다 — curl의 --resolve로
+        # "이 호스트:포트로의 접속은 무조건 127.0.0.1로 보내라"고 강제해, 진짜 도메인 없이도
+        # nginx의 자체 서명 인증서(CN=DOMAIN_NAME)와 WORDPRESS_URL이 기대하는 호스트명으로 접근할 수 있게 한다.
+        # --insecure는 바로 그 자체 서명 인증서라 브라우저 신뢰 체인 검증을 통과할 수 없기 때문에 끄는 것
         url = f"https://{self.domain}:{self.port}{path}"
         result = subprocess.run(
             [
@@ -481,6 +518,9 @@ class RuntimeStack:
         return result.stdout
 
     def verify_e2e(self) -> None:
+        # 예약해둔 포트를 일부러 다른 소켓으로 미리 점유해, start()의 포트 충돌 감지·재시도 경로
+        # (위 start() 주석 참고)가 실제로 동작하는지부터 확인한다 — "테스트 대상 기능을 위한 테스트"가
+        # 시나리오 맨 앞에 끼워져 있는 셈
         blocked_port = self.port
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
             listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -527,6 +567,10 @@ class RuntimeStack:
             raise StackError("MariaDB 조회 결과가 WordPress 입력과 다릅니다")
         print(f"isolated end-to-end check passed: project={self.project} port={self.port}")
 
+    # srcs/requirements/wordpress/tools/docker-entrypoint.sh의 prepare_config_location()이 다루는
+    # "예전 레이아웃(웹 루트에 wp-config.php 실물 파일)에서 새 레이아웃(별도 볼륨 + 심볼릭 링크)으로
+    # 마이그레이션"하는 경로를 실제로 재현해 검증한다 — 1회성 컨테이너 안에서 직접 파일을 예전 모습으로
+    # 만들어놓은 뒤, application 부트스트랩을 다시 돌려 그 마이그레이션 로직이 제대로 수렴시키는지 확인
     def _verify_legacy_config_migration(self) -> None:
         self.run_compose("stop", "nginx", "wordpress")
         self.run_compose(
@@ -598,6 +642,8 @@ class RuntimeStack:
             "wp_mkdir_p(WP_CONTENT_DIR . '/uploads'); "
             f'file_put_contents(WP_CONTENT_DIR . "/uploads/{php_file}", "{php_value}");',
         )
+        # docker-compose.yml의 volumes: 아래 선언된 이름 있는 볼륨 개수(mariadb_data, wordpress_data,
+        # wordpress_config)와 정확히 일치해야 한다
         initial_volumes = self.project_volumes()
         if len(initial_volumes) != 3:
             raise StackError(f"예상한 영구 볼륨 세 개를 찾지 못했습니다: {initial_volumes}")
@@ -609,6 +655,7 @@ class RuntimeStack:
             file_value=file_value,
         )
 
+        # 1단계: 컨테이너 프로세스만 재시작(restart) — 볼륨은 애초에 안 바뀌므로 데이터가 보존되는 게 당연
         self.run_compose("restart", "mariadb", "wordpress", "nginx")
         self.run_compose("up", "--detach", "--wait", "--wait-timeout", "240")
         self._verify_persistent_values(
@@ -619,6 +666,9 @@ class RuntimeStack:
             file_value=file_value,
         )
 
+        # 2단계: 컨테이너 자체를 내렸다가(down) 다시 만든다(up) — 이번엔 이름 있는 볼륨은 그대로 재사용되고
+        # 컨테이너만 새로 생성되는 것이 Compose의 계약이므로, 그 계약이 실제로 지켜지는지를 볼륨 식별자
+        # 집합이 이전과 같은지(같은 볼륨을 재사용) 비교해 확인한다
         self.run_compose("down", "--remove-orphans", "--timeout", "20")
         self.run_compose("up", "--detach", "--wait", "--wait-timeout", "240")
         recreated_volumes = self.project_volumes()
@@ -643,6 +693,10 @@ class RuntimeStack:
         environment: dict[str, str] | None = None,
         check: bool = True,
     ) -> subprocess.CompletedProcess[str]:
+        # subprocess.run이 아니라 Popen + communicate(timeout=...)를 직접 쓰는 이유는, 시간 초과 시
+        # subprocess.run처럼 곧바로 강제 종료(kill)하는 대신 _terminate_process로 SIGTERM부터 보내
+        # 점진적으로 종료를 시도할 여지를 남기기 위함 — 백업/복원 도구가 자기 신호 핸들러로 정리할
+        # 기회를 준 뒤에야 최후 수단으로 죽인다
         path_option = "--output" if operation == "backup" else "--input"
         command = [
             sys.executable,
@@ -681,6 +735,8 @@ class RuntimeStack:
             )
         return result
 
+    # SIGTERM(정상 종료 요청) → 대기 → 그래도 안 죽으면 SIGKILL(강제 종료) → 그래도 파이프가 안 닫히면
+    # 파이프를 직접 닫고 wait — 단계적으로 강도를 높여가는 표준적인 프로세스 종료 관용구
     def _terminate_process(
         self, process: subprocess.Popen[str]
     ) -> tuple[str, str]:
@@ -700,6 +756,11 @@ class RuntimeStack:
                 process.wait(timeout=PROCESS_TIMEOUT_SECONDS)
                 return "", "종료된 자식 프로세스가 출력 파이프를 닫지 않았습니다"
 
+    # 아래 여러 _interrupt_*/_verify_pause_signal_race 메서드가 공유하는 폴링 루프 — 도구가
+    # --pause-after/--pause-ready-file로 특정 단계에서 멈추면 그 사실을 파일 생성으로 알리는데(운영
+    # 도구들의 pause_for_test와 짝을 이루는 패턴), 그 파일이 생길 때까지 기다렸다가 그 시점에 프로세스를
+    # 신호로 찔러본다. time.monotonic()을 쓰는 이유는 시스템 시각이 도중에 바뀌어도(NTP 보정 등)
+    # 경과 시간 계산이 흔들리지 않기 때문
     def _wait_for_ready_file(
         self,
         process: subprocess.Popen[str],
@@ -723,6 +784,12 @@ class RuntimeStack:
                 )
             time.sleep(0.1)
 
+    # stack_backup.py의 project_operation_lock/pause_for_test(잠금을 건 채로 테스트를 위해 일시정지하는
+    # 공용 유틸리티)가 "정지해 있는 동안 종료 신호가 오는" 경합 상황에서도 준비 파일을 안전하게 지우고
+    # 실패로 끝나는지를 검증한다. python -c로 즉석에서 만든 짧은 스크립트를 서브프로세스로 띄우는 이유는
+    # 신호를 받는 대상이 "이 테스트 프로세스 자신"이 아니라 "독립된 별도 프로세스"여야 하기 때문 —
+    # 신호 처리는 프로세스 단위라 같은 프로세스 안에서는 이 경합을 재현할 수 없다. 12번 반복하며
+    # SIGINT/SIGTERM을 번갈아 보내는 것은 타이밍에 좌우되는 경합을 한 번의 시도로는 못 잡을 수 있어서다
     def _verify_pause_signal_race(self) -> None:
         script = "\n".join(
             (
@@ -775,6 +842,11 @@ class RuntimeStack:
                     f"{stderr.strip() or stdout.strip()}"
                 )
 
+    # entrypoint 스크립트의 pause_after(stage)가 걸어둔 지점까지 부트스트랩을 진행시킨 뒤, 그 순간
+    # 컨테이너를 SIGKILL로 "정전처럼" 갑자기 죽인다 — 정상 종료 신호(TERM 등)로 죽이면 entrypoint의
+    # trap이 정리할 기회를 가지므로, 그 기회조차 없는 가장 가혹한 실패를 재현하는 것이 목적.
+    # 죽이기 전 라벨을 확인하는 것은 tools/start_stack.py의 remove_stale_bootstrap과 같은 이유 —
+    # 이름이 같은 엉뚱한 컨테이너를 잘못 죽이지 않기 위함
     def _interrupt_bootstrap(
         self, *, action: str, service: str, stage: str
     ) -> None:
@@ -852,6 +924,10 @@ class RuntimeStack:
             "find /var/www/config -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +",
         )
 
+    # mariadb/wordpress entrypoint 스크립트가 정의한 모든 pause_after 단계 이름을 하나씩 순회하며
+    # "그 단계 직후 SIGKILL로 죽었다가, 부트스트랩을 처음부터 다시 실행했을 때 올바른 최종 상태로
+    # 수렴하는가"를 확인한다 — 부트스트랩 스크립트의 멱등성(같은 단계에서 몇 번을 다시 죽고 되살아나도
+    # 결과가 같아야 함)을 단계별로 촘촘하게 검증하는 것이 이 시나리오의 핵심
     def verify_bootstrap_recovery(self) -> None:
         self.started = True
         self.run_compose(
@@ -955,6 +1031,9 @@ class RuntimeStack:
         pause_after: str,
         signum: signal.Signals,
     ) -> subprocess.CompletedProcess[str]:
+        # _interrupt_bootstrap과 같은 발상을 백업/복원 도구에 적용한 것 — 다만 이번엔 컨테이너가 아니라
+        # 이 도구(stack_backup.py) 프로세스 자체를 지정한 신호로 중단시켜, 그 신호 핸들러가 임시 파일을
+        # 안전하게 정리하고 실패로 보고하는지를 검증한다
         ready_file = project.temp / f"{operation}-{pause_after}.ready"
         path_option = "--output" if operation == "backup" else "--input"
         command = [
@@ -1006,6 +1085,11 @@ class RuntimeStack:
             )
         return result
 
+    # project_operation_lock은 /tmp 아래 UID 기준 디렉터리에 잠금 파일을 두므로, 두 프로세스의 TMPDIR
+    # 환경변수를 일부러 서로 다르게 설정해도(각자 다른 임시 디렉터리를 쓰더라도) 같은 프로젝트 이름이면
+    # 여전히 같은 잠금을 공유해 서로를 막아서는지를 확인한다 — 잠금이 TMPDIR 같은 프로세스별 환경이 아니라
+    # 프로젝트 이름 자체에 묶여 있다는 것을 증명하는 검사. 잠금을 쥔 프로세스는 즉석 스크립트로 만들어
+    # 준비 파일을 쓴 뒤 그대로 오래 대기시켜 놓고, 그동안 실제 backup 명령이 잠금 획득에 실패하는지 확인한다
     def _verify_shared_operation_lock(self) -> None:
         first_tmp = self.temp / "lock-tmp-first"
         second_tmp = self.temp / "lock-tmp-second"
@@ -1072,6 +1156,9 @@ class RuntimeStack:
             self._terminate_process(holder)
             ready_file.unlink(missing_ok=True)
 
+    # 복원 대상 프로젝트 이름으로 미리 컨테이너·볼륨·네트워크를 하나씩 만들어두고, 그 상태에서 복원을
+    # 시도했을 때 "정지된 컨테이너 하나만 있어도, 자원 종류가 무엇이든" 기존 것을 지우지 않고 거부하는지
+    # 확인한다 — 복원이 실수로 무관한 기존 자원을 밀어버리지 않는다는 안전장치를 자원 종류별로 반복 검증
     def _verify_restore_resource_refusal(
         self, backup: Path, restored: "RuntimeStack"
     ) -> None:
@@ -1168,6 +1255,11 @@ class RuntimeStack:
                     timeout=PROCESS_TIMEOUT_SECONDS,
                 )
 
+    # 이 시나리오는 백업/복원 도구를 정상 경로뿐 아니라 "기존 출력 보존", "dangling 심볼릭 링크 거부",
+    # "중간 실패 주입 후 정리", "신호로 중단 후 정리", "대용량 파일·대용량 DB 값의 무결성", "이미 자원이
+    # 있는 대상에 대한 복원 거부"까지 한 번에 훑는다. 아래에서 32MiB 랜덤 파일과 4MiB짜리 DB 값을
+    # 일부러 만들어 체크섬/길이로 비교하는 것은, 작은 텍스트만으로는 안 드러나는 스트리밍·버퍼 처리
+    # 버그(예: 큰 데이터가 중간에 잘리는 문제)까지 잡기 위함
     def verify_backup_restore(self) -> None:
         self.start()
         self._verify_pause_signal_race()
@@ -1439,6 +1531,10 @@ class RuntimeStack:
         except subprocess.TimeoutExpired as error:
             raise StackError("자격증명 회전 도구가 제한 시간 안에 끝나지 않았습니다") from error
 
+    # tools/rotate_secrets.py의 신호 처리 설계(_rotate의 signal_state["deferred"] 참고)를 정확히 겨냥한
+    # 이중 신호 시나리오다: 먼저 호스트 비밀 파일까지 다 바꾼 시점(host-files)에서 SIGTERM을 보내
+    # 롤백을 시작시키고, 롤백이 "진행 중"이라는 두 번째 준비 파일이 생기는 순간을 노려 SIGINT를 또
+    # 보낸다 — 롤백 도중에 또 신호가 와도 롤백을 끊지 않고 끝까지 마친 뒤 "지연 처리했다"고 보고하는지 확인
     def _interrupt_rotation_tool(
         self,
         directory: Path,
@@ -1494,6 +1590,9 @@ class RuntimeStack:
             )
         return result
 
+    # 아래 세 _*_works/_matches 메서드는 tools/rotate_secrets.py 안의 동명 검증 로직과 같은 것을 검사하지만,
+    # 그 모듈을 import하지 않고 docker compose exec로 매번 새로 실행한다 — 회전 도구 자신의 코드가 아니라
+    # "회전이 끝난 뒤 실제 컨테이너 상태"를 기준으로 독립적으로 재확인하기 위함(순환 검증 방지)
     def _sql_password_works(self, kind: str, password: str) -> bool:
         if kind == "root":
             service = "mariadb"
@@ -1568,6 +1667,9 @@ if ($text === false || !preg_match($pattern, $text, $matches) || !hash_equals($p
         )
         return result.returncode == 0
 
+    # rotate_secrets.py의 atomic_secret_write/root_sql/app_sql이 만드는 임시 파일 이름 패턴
+    # (container-stack-root.*, .wp-config.rotate.* 등)이 회전이 끝난 뒤에도 호스트나 컨테이너 안에
+    # 남아있지 않은지 확인 — "정리를 깜빡한 임시 파일"이 곧 비밀값이 남아도는 경로가 될 수 있어서 검사한다
     def _assert_no_rotation_temporary_files(self) -> None:
         if list(self.temp.glob(".*.txt.*")):
             raise StackError("호스트에 자격증명 임시 파일이 남았습니다")
@@ -1601,6 +1703,10 @@ if ($text === false || !preg_match($pattern, $text, $matches) || !hash_equals($p
             if result.returncode != 0:
                 raise StackError(f"{service} 컨테이너에 자격증명 임시 파일이 남았습니다")
 
+    # 회전 시나리오 전체가 반복해서 재사용하는 "지금이 정확히 이 상태여야 한다"는 검증 묶음 —
+    # 호스트 비밀 파일 값·권한, DB root/app 비밀번호, wp-config, WordPress 계정 비밀번호가 모두
+    # expected와 일치하고 rejected와는 불일치해야 한다(양방향 검증). 실제로 글을 쓰고 HTTPS로 읽어
+    # 스택이 여전히 기능하는지까지 확인한 뒤, 임시 파일 잔존 여부와 런타임 경계까지 마무리로 검사한다
     def _assert_rotation_state(
         self,
         expected: dict[str, str],
@@ -1654,6 +1760,12 @@ if ($text === false || !preg_match($pattern, $text, $matches) || !hash_equals($p
         self._assert_no_rotation_temporary_files()
         self.assert_runtime_secret_boundary(expected)
 
+    # 흐름: (1) 정상 회전 한 번 → (2) rotate_secrets.py의 FAILURE_STAGES 각 단계마다 실패를 주입해
+    # 그때마다 롤백이 이전 상태로 완전히 되돌리는지 확인 → (3) 신호로 중단시킨 회전도 롤백되는지 확인 →
+    # (4) 롤백 직후 "같은 입력 파일"로 다시 회전을 시도했을 때 이번엔 성공하는지(재시도 가능성) 확인 →
+    # (5) 이 시나리오 동안 등장했던 모든 비밀값 집합이 Compose 로그 어디에도 남지 않았는지 마지막에 총정리.
+    # 입력 비밀 파일들의 스냅샷(assert_input_unchanged)을 매번 비교하는 것은, 회전 도구가 실패하든
+    # 성공하든 "새 비밀값이 적힌 원본 디렉터리 자체"는 절대 건드리지 않아야 한다는 계약을 확인하기 위함
     def verify_secret_rotation(self) -> None:
         self.start()
         initial_values = dict(self.credential_values)
@@ -1754,6 +1866,11 @@ if ($text === false || !preg_match($pattern, $text, $matches) || !hash_equals($p
                     raise StackError("Compose 로그에 자격증명 값이 포함되었습니다")
         print("secret rotation, ambiguous failures, rollback, and retry passed")
 
+    # 이 시나리오는 세 갈래로 나뉜다: (1) docker inspect로 얻은 실제 컨테이너의 자원 제한·로그 정책·
+    # 보안 옵션·네트워크 소속을 docker-compose.yml에 선언된 값(값 자체는 이 함수 안 expected에 다시
+    # 못박아 둠)과 하나하나 비교, (2) `make fclean`이 DESTROY_CONFIRM 없이는 절대 실행되지 않는지
+    # 확인(Makefile의 안전장치 검증), (3) tools/diagnose_stack.py가 비밀값을 실제로 가리는지, 못 읽는
+    # 비밀 파일이 있으면 아예 중단하는지, 기존 결과·심볼릭 링크 출력 경로를 거부하는지를 확인
     def verify_operations(self) -> None:
         self.start()
         expected = {
@@ -1843,6 +1960,9 @@ if ($text === false || !preg_match($pattern, $text, $matches) || !hash_equals($p
             if actual_members != expected_members:
                 raise StackError(f"{name} 네트워크의 연결 서비스가 예상과 다릅니다")
 
+        # DESTROY_CONFIRM을 일부러 넘기지 않고 fclean을 실행 — Makefile의 안전장치(fclean 타겟 참고)가
+        # 실수로 볼륨·이미지를 지우는 것을 막아주는지, 그리고 그 시도 자체가 이미 떠 있는 스택에
+        # 아무 영향도 주지 않는지(바로 아래 healthz 재확인)를 함께 검증
         refused = subprocess.run(
             [
                 "make",
@@ -1861,8 +1981,13 @@ if ($text === false || !preg_match($pattern, $text, $matches) || !hash_equals($p
         if self.fetch("/healthz").strip() != "ok":
             raise StackError("삭제 거부 뒤 실행 중인 스택이 손상되었습니다")
 
+        # 비밀값을 쿼리 문자열로 흘려보내 nginx 접근 로그 등에 실제로 새어 들어가게 만든 뒤,
+        # 진단 도구가 그런 로그까지 포함해서 값을 가려내는지(가려내지 못하면 아래 combined 검사에서 걸림)
+        # 확인하기 위한 사전 준비
         log_secret = self.credential_values["wp_user_password.txt"]
         self.fetch(f"/?diagnostic_token={log_secret}")
+        # 비밀 파일 하나를 일부러 못 읽게(권한 0) 만들어, 진단 도구가 "가릴 값 자체를 못 읽으면"
+        # 부분적으로라도 진행하는 대신 아예 아무 결과도 남기지 않고 중단하는지 확인
         unreadable_secret = self.temp / "wp_user_password.txt"
         unreadable_output = self.temp / "unreadable-secret-diagnostics"
         unreadable_command = [
@@ -2016,6 +2141,10 @@ if ($text === false || !preg_match($pattern, $text, $matches) || !hash_equals($p
                 "검사용 이미지 태그를 정리하지 못했습니다: " + "; ".join(failures)
             )
 
+    # 회전 도구의 rollback_rotation()과 같은 "최선 노력" 정리 방식 — 각 정리 단계를 개별 try/except로
+    # 감싸 하나가 실패해도 나머지 정리는 계속 시도하고, 실패 내역을 모아 반환한다. --keep 플래그가
+    # 켜져 있으면 정리를 아예 건너뛰고 프로젝트를 그대로 남겨, 실패 원인을 사람이 직접 컨테이너에
+    # 들어가 조사할 수 있게 한다(디버깅 편의)
     def close(self, *, failed: bool) -> list[str]:
         failures: list[str] = []
         if failed:
@@ -2102,6 +2231,9 @@ def main() -> int:
         print(f"검증 환경을 준비하지 못했습니다: {error}", file=sys.stderr)
         return 2
 
+    # failed는 "정상적으로 끝까지 성공했는가"의 반대 표시로 시작해(True), try 블록이 예외 없이 끝까지
+    # 돌면 그제서야 False로 내려간다 — finally의 close(failed=failed)가 이 값으로 "실패했을 때만
+    # 진단 자료를 남긴다"는 위 close()의 분기를 결정한다
     failed = True
     result = 0
     try:
